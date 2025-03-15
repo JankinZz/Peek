@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Safari AI 总结插件
-// @version      0.3.0
+// @version      1.3.1
 // @description  一键总结网页和视频内容的Safari插件
 // @author       Jan
 // @match        *://*/*
@@ -21,14 +21,93 @@
     
     // 插件配置
     const CONFIG = {
-        version: '1.2.0',
+        version: '1.3.1',
         supportedVideoSites: ['youtube.com', 'bilibili.com', 'vimeo.com'],
-        // API配置 - 硬编码参数
-        apiUrl: 'https://api.siliconflow.cn/v1/chat/completions',
-        apiKey: '',  // 在此处填入您的API密钥
-        modelName: 'Vendor-A/Qwen/Qwen2.5-72B-Instruct',
+        
+        // 存储相关
+        storageKeys: {
+            API_KEY_OPENAI: 'ai_summary_api_key_openai',
+            API_KEY_GEMINI: 'ai_summary_api_key_gemini',
+            API_MODE: 'ai_summary_api_mode',
+            FIRST_USE: 'ai_summary_first_use'
+        },
+        
+        // 对话框尺寸配置
+        ui: {
+            initialHeight: '400px',
+            minHeight: '180px',
+            maxHeight: '70vh',
+            width: '380px',
+            mobileWidth: '85vw',
+            animationDuration: '0.3s'
+        },
+        
+        // API配置 - 可选不同AI服务
+        apiMode: 'openai', // 'openai' 或 'gemini'，指定使用哪种API
+        apis: {
+            openai: {
+                url: 'https://api.openai.com/v1/chat/completions',
+                apiKey: '', // 会在初始化时从localStorage加载
+                modelName: 'gpt-3.5-turbo',
+                headers: function() {
+                    return {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${this.apiKey}`
+                    };
+                },
+                buildRequestBody: function(messages, temperature, maxTokens) {
+                    return {
+                        model: this.modelName,
+                        messages: messages,
+                        temperature: temperature,
+                        max_tokens: maxTokens
+                    };
+                },
+                extractContent: function(response) {
+                    return response.choices[0].message.content;
+                }
+            },
+            gemini: {
+                url: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent',
+                apiKey: '', // 会在初始化时从localStorage加载
+                modelName: 'gemini-pro',
+                headers: function() {
+                    return {
+                        'Content-Type': 'application/json'
+                    };
+                },
+                buildRequestBody: function(messages, temperature, maxTokens) {
+                    // 转换OpenAI格式的消息到Gemini格式
+                    const contents = messages.map(msg => {
+                        return {
+                            role: msg.role === 'system' ? 'user' : msg.role,
+                            parts: [{ text: msg.content }]
+                        };
+                    });
+                    
+                    return {
+                        contents: contents,
+                        generationConfig: {
+                            temperature: temperature,
+                            maxOutputTokens: maxTokens,
+                            topP: 0.9
+                        }
+                    };
+                },
+                extractContent: function(response) {
+                    return response.candidates[0].content.parts[0].text;
+                }
+            }
+        },
+        
+        // 通用API参数
         temperature: 0.6,
         maxTokens: 1000,
+        detailedMaxTokens: 2000,
+        retryCount: 3,
+        retryDelays: [1000, 3000, 5000], // 重试延迟间隔（毫秒）
+        
+        // 提示词模板
         summarySystemPrompt: `你是一个专业的内容总结助手，擅长提取文章或视频的关键信息，并以简洁明了的方式呈现。
 请遵循以下原则：
 1. 保持客观，不添加个人观点
@@ -64,13 +143,35 @@
 3. 区分事实陈述和推测性回答
 4. 保持客观，使用简洁清晰的语言`,
 
-        summaryLength: 500,  // 默认摘要长度
+        summaryLength: 500,  // 默认摘要长度（字符数）
+        detailedSummaryLength: 1000, // 详细摘要长度（字符数）
  
         // UI配置
         fontFamily: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
-        primaryColor: '#4285f4',
-        backgroundColor: '#ffffff',
-        textColor: '#333333',
+        colors: {
+            light: {
+                primaryColor: '#4285f4',
+                backgroundColor: '#ffffff',
+                secondaryBgColor: '#f5f5f7',
+                textColor: '#333333',
+                secondaryTextColor: '#666666',
+                borderColor: '#e1e1e1',
+                errorColor: '#d32f2f',
+                highlightColor: '#fff59d'
+            },
+            dark: {
+                primaryColor: '#4285f4',
+                backgroundColor: '#333333',
+                secondaryBgColor: '#444444',
+                textColor: '#f5f5f5',
+                secondaryTextColor: '#aaaaaa',
+                borderColor: '#666666',
+                errorColor: '#ff6b6b',
+                highlightColor: '#665c00'
+            }
+        },
+        
+        // 公共样式属性
         borderRadius: '8px',
         boxShadow: '0 2px 10px rgba(0,0,0,0.2)'
     };
@@ -83,7 +184,11 @@
         CONVERSATION: 'conversation',
         ACTIVE_TAB: 'active_tab'
     };
- 
+
+    // 全局变量
+    let isDarkMode = false; // 深色模式状态
+    let domCache = {}; // DOM元素缓存
+    
     /**
      * ====================================================
      * 2. 会话管理器
@@ -199,1138 +304,32 @@
         };
     })();
 
-    // 检查当前环境
-    function checkEnvironment() {
-        // 检查是否在Safari中运行及版本兼容性
-        const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-        if (!isSafari) {
-            console.warn('AI总结插件: 当前浏览器可能不是Safari，部分功能可能无法正常工作');
-        }
-        
-        // 检查是否为支持的视频网站
-        const isVideoSite = CONFIG.supportedVideoSites.some(site => window.location.href.includes(site));
-        
-        return { isSafari, isVideoSite };
-    }
- 
-    // 初始化插件
-    async function initializePlugin() {
-        try {
-            // 初始化会话管理器
-            SessionManager.initialize();
-            
-            // 初始化UI组件
-            UIController.initialize();
-            
-            // 尝试恢复之前的会话状态
-            UIController.tryRestoreSessionState();
-            
-            // 注册事件监听
-            UIController.registerEvents({
-                onSummarizeClick: handleSummarizeClick,
-                onUserQuestion: handleUserQuestion,
-                onSummaryDetailToggle: handleSummaryDetailToggle,
-                onTabChange: handleTabChange
-            });
-            
-            console.log('AI总结插件初始化完成，版本:', CONFIG.version);
-        } catch (error) {
-            console.error('插件初始化失败:', error);
-        }
-    }
- 
-    // 处理总结按钮点击
-    async function handleSummarizeClick() {
-        try {
-            // 检查是否有之前的会话
-            const summary = SessionManager.getSession(SESSION_KEYS.SUMMARY);
-            const keypoints = SessionManager.getSession(SESSION_KEYS.KEYPOINTS);
-            
-            if (summary && keypoints) {
-                // 恢复之前的会话
-                UIController.showDialog();
-                UIController.restoreAllTabs();
-                return;
-            }
-            
-            UIController.showLoadingState();
-            
-            // 判断页面类型并提取内容
-            const { isVideoSite } = checkEnvironment();
-            let content;
-            
-            if (isVideoSite) {
-                content = await ContentExtractor.extractVideoContent();
-            } else {
-                content = await ContentExtractor.extractTextContent();
-            }
-            
-            // 若内容为空或过短则提示
-            if (!content || content.length < 100) {
-                UIController.showError('当前页面内容过少或无法提取，请尝试其他页面');
-                return;
-            }
-            
-            // 保存原始内容以便后续使用
-            SessionManager.saveSession(content, SESSION_KEYS.ORIGINAL_CONTENT);
-            
-            // 并行获取总结和关键要点
-            try {
-                const [summary, keypointsResult] = await Promise.all([
-                    APIService.getSummary(content, CONFIG.summaryLength),
-                    APIService.getKeypoints(content)
-                ]);
-                
-                // 保存并显示结果
-                SessionManager.saveSession(summary, SESSION_KEYS.SUMMARY);
-                SessionManager.saveSession(keypointsResult, SESSION_KEYS.KEYPOINTS);
-                
-                UIController.displaySummary(summary);
-                UIController.displayKeypoints(keypointsResult);
-                UIController.setActiveTab('summary');
-            } catch (error) {
-                console.error('API请求失败:', error);
-                UIController.showError(`获取内容失败: ${error.message}`);
-            }
-            
-        } catch (error) {
-            UIController.showError(`总结失败: ${error.message}`);
-            console.error('总结失败:', error);
-        }
-    }
- 
-    // 处理标签切换
-    function handleTabChange(tabName) {
-        UIController.setActiveTab(tabName);
-        SessionManager.saveSession(tabName, SESSION_KEYS.ACTIVE_TAB);
-    }
-    
-    // 处理摘要详细/简短切换
-    async function handleSummaryDetailToggle(isDetailed) {
-        try {
-            // 获取原始内容
-            const originalContent = SessionManager.getSession(SESSION_KEYS.ORIGINAL_CONTENT);
-            if (!originalContent) {
-                throw new Error('无法获取原始内容，请重新总结');
-            }
-            
-            UIController.showMoreDetailedLoading();
-            
-            // 获取更详细或简短的摘要
-            const length = isDetailed ? CONFIG.summaryLength * 2 : CONFIG.summaryLength;
-            const summary = await APIService.getSummary(originalContent, length);
-            
-            // 保存并显示摘要
-            SessionManager.saveSession(summary, SESSION_KEYS.SUMMARY);
-            UIController.displaySummary(summary, isDetailed);
-            
-        } catch (error) {
-            UIController.showError(`获取${isDetailed ? '详细' : '简短'}摘要失败: ${error.message}`);
-            console.error(`获取${isDetailed ? '详细' : '简短'}摘要失败:`, error);
-        }
-    }
- 
-    // 处理用户提问
-    async function handleUserQuestion(question) {
-        try {
-            UIController.showQuestionLoading(question);
-            
-            // 获取当前上下文
-            const summary = SessionManager.getSession(SESSION_KEYS.SUMMARY) || '';
-            const originalContent = SessionManager.getSession(SESSION_KEYS.ORIGINAL_CONTENT) || '';
-            
-            // 调用API获取回答
-            const answer = await APIService.askQuestion(question, summary, originalContent);
-            
-            // 显示回答
-            UIController.displayAnswer(question, answer);
-            UIController.setActiveTab('conversation');
-            
-            // 保存对话历史
-            const conversations = SessionManager.getSession(SESSION_KEYS.CONVERSATION) || [];
-            conversations.push({ question, answer });
-            SessionManager.saveSession(conversations, SESSION_KEYS.CONVERSATION);
-            
-        } catch (error) {
-            UIController.showError(`回答问题失败: ${error.message}`);
-            console.error('回答问题失败:', error);
-        }
-    }
- 
-    /**
-     * ====================================================
-     * 3. UI控制器
-     * ====================================================
-     */
-    const UIController = (function() {
-        // UI元素引用
-        let summaryButton = null;
-        let dialogContainer = null;
-        let minimizedIcon = null;
-        let activeTab = 'summary'; // 当前激活的标签: summary, keypoints, conversation
-        let isDetailedSummary = false; // 当前是否为详细摘要
-        
-        // 初始化UI
-        function initialize() {
-            createSummaryButton();
-        }
-        
-        // 创建总结按钮
-        function createSummaryButton() {
-            // 检查按钮是否已存在
-            if (document.getElementById('ai-summary-btn')) return;
-            
-            // 创建按钮元素
-            summaryButton = document.createElement('button');
-            summaryButton.id = 'ai-summary-btn';
-            summaryButton.title = 'AI内容总结';
-            // 使用简单的SVG图标
-            summaryButton.innerHTML = `
-                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="4" y="5" width="16" height="16" rx="2" />
-                    <line x1="4" y1="9" x2="20" y2="9" />
-                    <line x1="8" y1="13" x2="16" y2="13" />
-                    <line x1="8" y1="17" x2="12" y2="17" />
-                </svg>
-            `;
-            summaryButton.className = 'ai-summary-button';
-            
-            // 添加样式，确保兼容性和正方形按钮
-            const style = document.createElement('style');
-            style.textContent = `
-                .ai-summary-button {
-                    position: fixed;
-                    bottom: 20px;
-                    right: 20px;
-                    z-index: 9999;
-                    background-color: #4285f4;
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    width: 50px;
-                    height: 50px;
-                    cursor: pointer;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-                    -webkit-box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-                    transition: all 0.3s ease;
-                    -webkit-transition: all 0.3s ease;
-                    appearance: none;
-                    -webkit-appearance: none;
-                }
-                
-                .ai-summary-button:hover {
-                    background-color: #5c9cff;
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-                    -webkit-box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-                }
-                
-                .ai-summary-button svg {
-                    width: 24px;
-                    height: 24px;
-                }
-                
-                .ai-summary-dialog {
-                    position: fixed;
-                    right: 30px;
-                    bottom: 30px;
-                    width: 380px;
-                    height: 16.7vh;
-                    min-height: 180px;
-                    max-width: 85vw;
-                    background-color: white;
-                    border-radius: 10px;
-                    box-shadow: 0 5px 20px rgba(0,0,0,0.3);
-                    -webkit-box-shadow: 0 5px 20px rgba(0,0,0,0.3);
-                    display: flex;
-                    flex-direction: column;
-                    z-index: 10000;
-                    overflow: hidden;
-                    font-family: ${CONFIG.fontFamily};
-                    transition: all 0.3s ease;
-                }
-                
-                @media (max-width: 480px) {
-                    .ai-summary-dialog {
-                        width: 85vw;
-                        right: 15px;
-                        bottom: 15px;
-                    }
-                }
-                
-                .dialog-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    padding: 8px 15px;
-                    background-color: #f5f5f7;
-                    border-bottom: 1px solid #e1e1e1;
-                    user-select: none;
-                    height: 38px;
-                    box-sizing: border-box;
-                }
-                
-                .dialog-header h3 {
-                    margin: 0;
-                    font-size: 16px;
-                    font-weight: 500;
-                    color: #333;
-                }
-                
-                .dialog-controls {
-                    display: flex;
-                    gap: 8px;
-                }
-                
-                .icon-button {
-                    background: none;
-                    border: none;
-                    font-size: 16px;
-                    cursor: pointer;
-                    width: 24px;
-                    height: 24px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    border-radius: 4px;
-                    transition: background-color 0.2s;
-                }
-                
-                .icon-button:hover {
-                    background-color: rgba(0,0,0,0.1);
-                }
-                
-                .tabs-container {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    height: 38px;
-                    border-bottom: 1px solid #e1e1e1;
-                    background-color: #fff;
-                }
-                
-                .tab-button {
-                    flex: 1;
-                    height: 100%;
-                    background: none;
-                    border: none;
-                    cursor: pointer;
-                    font-size: 14px;
-                    font-weight: 500;
-                    color: #666;
-                    transition: all 0.2s;
-                    position: relative;
-                }
-                
-                .tab-button:hover {
-                    background-color: #f9f9f9;
-                }
-                
-                .tab-button.active {
-                    color: #4285f4;
-                    background-color: #f5f8ff;
-                }
-                
-                .tab-button.active::after {
-                    content: '';
-                    position: absolute;
-                    bottom: 0;
-                    left: 0;
-                    width: 100%;
-                    height: 2px;
-                    background-color: #4285f4;
-                }
-                
-                .dialog-body {
-                    flex: 1;
-                    display: flex;
-                    flex-direction: column;
-                    overflow: hidden;
-                    position: relative;
-                }
-                
-                .tab-content {
-                    position: absolute;
-                    top: 0;
-                    left: 0;
-                    width: 100%;
-                    height: 100%;
-                    overflow-y: auto;
-                    overflow-x: hidden;
-                    display: none;
-                    padding: 12px 15px;
-                    box-sizing: border-box;
-                    word-wrap: break-word;
-                    overflow-wrap: break-word;
-                }
-                
-                .tab-content.active {
-                    display: block;
-                }
-                
-                #summary-tab {
-                    display: flex;
-                    flex-direction: column;
-                }
-                
-                #keypoints-tab {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 10px;
-                }
-                
-                #conversation-tab {
-                    display: flex;
-                    flex-direction: column;
-                }
-                
-                .summary-text {
-                    flex: 1;
-                    line-height: 1.5;
-                    font-size: 14px;
-                    overflow-y: auto;
-                    padding-right: 5px;
-                    margin-bottom: 10px;
-                    word-wrap: break-word;
-                    overflow-wrap: break-word;
-                    white-space: normal;
-                }
-                
-                .summary-text p {
-                    margin-bottom: 10px;
-                }
-                
-                .summary-actions {
-                    display: flex;
-                    justify-content: center;
-                    margin-top: auto;
-                    padding-top: 8px;
-                }
-                
-                .summary-button {
-                    background-color: #f5f5f7;
-                    color: #333;
-                    border: 1px solid #ddd;
-                    border-radius: 18px;
-                    padding: 6px 12px;
-                    cursor: pointer;
-                    font-size: 13px;
-                    transition: all 0.2s ease;
-                }
-                
-                .summary-button:hover {
-                    background-color: #e5e5e7;
-                }
-                
-                .keypoint-card {
-                    background-color: #f9f9f9;
-                    border-radius: 8px;
-                    padding: 8px 12px;
-                    border-left: 3px solid #4285f4;
-                    margin-bottom: 8px;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }
-                
-                .keypoint-card:hover {
-                    background-color: #f0f0f0;
-                }
-                
-                .keypoint-title {
-                    font-weight: 500;
-                    margin-bottom: 4px;
-                    font-size: 14px;
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                }
-                
-                .keypoint-detail {
-                    display: none;
-                    font-size: 13px;
-                    margin-top: 5px;
-                    line-height: 1.4;
-                }
-                
-                .keypoint-card.expanded .keypoint-detail {
-                    display: block;
-                }
-                
-                .keypoint-toggle {
-                    font-size: 12px;
-                    color: #666;
-                }
-                
-                .suggested-questions {
-                    margin-top: 10px;
-                    display: flex;
-                    flex-direction: column;
-                    gap: 8px;
-                }
-                
-                .suggested-question-button {
-                    background-color: #f0f5ff;
-                    color: #4285f4;
-                    border: 1px solid #d0e0ff;
-                    border-radius: 16px;
-                    padding: 6px 12px;
-                    cursor: pointer;
-                    font-size: 13px;
-                    text-align: left;
-                    transition: all 0.2s;
-                }
-                
-                .suggested-question-button:hover {
-                    background-color: #e0eaff;
-                }
-                
-                .conversation-container {
-                    flex: 1;
-                    display: flex;
-                    flex-direction: column;
-                    gap: 10px;
-                    overflow-y: auto;
-                    margin-bottom: 10px;
-                }
-                
-                .user-question {
-                    align-self: flex-end;
-                    background-color: #e1f5fe;
-                    padding: 8px 12px;
-                    border-radius: 18px 18px 0 18px;
-                    max-width: 80%;
-                    font-size: 13px;
-                    word-wrap: break-word;
-                    overflow-wrap: break-word;
-                    white-space: normal;
-                }
-                
-                .ai-answer {
-                    align-self: flex-start;
-                    background-color: #f5f5f7;
-                    padding: 8px 12px;
-                    border-radius: 18px 18px 18px 0;
-                    max-width: 80%;
-                    font-size: 13px;
-                    word-wrap: break-word;
-                    overflow-wrap: break-word;
-                    white-space: normal;
-                }
-                
-                .dialog-input {
-                    margin-top: auto;
-                    display: flex;
-                    padding: 8px 10px;
-                    border-top: 1px solid #e1e1e1;
-                    background-color: #fff;
-                }
-                
-                .dialog-input input {
-                    flex: 1;
-                    border: 1px solid #ddd;
-                    border-radius: 18px;
-                    padding: 6px 12px;
-                    font-size: 13px;
-                    outline: none;
-                }
-                
-                .dialog-input input:focus {
-                    border-color: #4285f4;
-                }
-                
-                .dialog-input button {
-                    background-color: #4285f4;
-                    color: white;
-                    border: none;
-                    border-radius: 18px;
-                    padding: 6px 12px;
-                    margin-left: 6px;
-                    cursor: pointer;
-                    font-size: 13px;
-                }
-                
-                .ai-minimized-icon {
-                    position: fixed;
-                    bottom: 20px;
-                    right: 20px;
-                    width: 50px;
-                    height: 50px;
-                    background-color: #4285f4;
-                    color: white;
-                    border-radius: 8px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    cursor: pointer;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-                    -webkit-box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-                    z-index: 9999;
-                    font-weight: bold;
-                }
-                
-                .loading-spinner {
-                    width: 24px;
-                    height: 24px;
-                    border: 3px solid #f3f3f3;
-                    border-top: 3px solid #4285f4;
-                    border-radius: 50%;
-                    animation: spin 1s linear infinite;
-                    margin: 0 auto 10px;
-                }
-                
-                .loading-spinner.small {
-                    width: 14px;
-                    height: 14px;
-                    border-width: 2px;
-                    margin: 0;
-                    display: inline-block;
-                    vertical-align: middle;
-                    margin-right: 8px;
-                }
-                
-                @keyframes spin {
-                    0% { transform: rotate(0deg); }
-                    100% { transform: rotate(360deg); }
-                }
-                
-                .error-message {
-                    color: #d32f2f;
-                    padding: 10px;
-                    border-radius: 5px;
-                    background-color: #ffebee;
-                    margin-bottom: 10px;
-                    font-size: 13px;
-                }
-                
-                .md-bold {
-                    font-weight: bold;
-                }
-                
-                .md-italic {
-                    font-style: italic;
-                }
-                
-                .md-underline {
-                    text-decoration: underline;
-                }
-                
-                .md-highlight {
-                    background-color: #fff59d;
-                    padding: 0 2px;
-                }
-                
-                .md-code {
-                    font-family: monospace;
-                    background-color: #f3f3f3;
-                    padding: 2px 4px;
-                    border-radius: 3px;
-                }
-                
-                .md-blockquote {
-                    border-left: 3px solid #ddd;
-                    padding-left: 10px;
-                    color: #555;
-                    font-style: italic;
-                }
-                
-                .md-link {
-                    color: #4285f4;
-                    text-decoration: underline;
-                    cursor: pointer;
-                }
-                
-                .md-list-item {
-                    margin-left: 20px;
-                    position: relative;
-                }
-                
-                .md-list-item::before {
-                    content: '•';
-                    position: absolute;
-                    left: -15px;
-                }
-            `;
-            document.head.appendChild(style);
-            
-            // 添加到页面
-            document.body.appendChild(summaryButton);
-        }
-        
-        // 创建对话框
-        function createDialog() {
-            // 检查对话框是否已存在
-            if (document.getElementById('ai-summary-dialog')) {
-                dialogContainer = document.getElementById('ai-summary-dialog');
-                return;
-            }
-            
-            // 创建对话框容器
-            dialogContainer = document.createElement('div');
-            dialogContainer.id = 'ai-summary-dialog';
-            dialogContainer.className = 'ai-summary-dialog';
-            
-            // 对话框HTML结构 - 添加标签页结构
-            dialogContainer.innerHTML = `
-                <div class="dialog-header">
-                    <h3>AI 内容总结</h3>
-                    <div class="dialog-controls">
-                        <button id="minimize-btn" title="最小化" class="icon-button">-</button>
-                        <button id="close-btn" title="关闭" class="icon-button">×</button>
-                    </div>
-                </div>
-                <div class="tabs-container">
-                    <button id="summary-tab-btn" class="tab-button active" data-tab="summary">总结</button>
-                    <button id="keypoints-tab-btn" class="tab-button" data-tab="keypoints">要点</button>
-                    <button id="conversation-tab-btn" class="tab-button" data-tab="conversation">对话</button>
-                </div>
-                <div class="dialog-body">
-                    <div id="summary-tab" class="tab-content active">
-                        <div id="summary-content" class="summary-text"></div>
-                        <div class="summary-actions">
-                            <button id="more-detailed-btn" class="summary-button">查看更详细摘要</button>
-                        </div>
-                    </div>
-                    <div id="keypoints-tab" class="tab-content">
-                        <div id="keypoints-container"></div>
-                        <div id="suggested-questions" class="suggested-questions"></div>
-                    </div>
-                    <div id="conversation-tab" class="tab-content">
-                        <div id="conversation-container" class="conversation-container"></div>
-                        <div class="dialog-input">
-                            <input type="text" id="user-question" placeholder="询问更多细节...">
-                            <button id="send-btn">发送</button>
-                        </div>
-                    </div>
-                </div>
-            `;
-            
-            // 添加到页面
-            document.body.appendChild(dialogContainer);
-            
-            // 注册对话框内部事件
-            document.getElementById('minimize-btn').addEventListener('click', minimizeDialog);
-            document.getElementById('close-btn').addEventListener('click', closeDialog);
-            document.getElementById('send-btn').addEventListener('click', sendQuestion);
-            document.getElementById('user-question').addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') {
-                    sendQuestion();
-                }
-            });
-            
-            // 注册标签页切换事件
-            document.querySelectorAll('.tab-button').forEach(button => {
-                button.addEventListener('click', () => {
-                    const tabName = button.dataset.tab;
-                    if (tabName && eventHandlers.onTabChange) {
-                        eventHandlers.onTabChange(tabName);
-                    }
-                });
-            });
-            
-            // 详细/简短摘要切换按钮事件
-            document.getElementById('more-detailed-btn').addEventListener('click', () => {
-                if (eventHandlers.onSummaryDetailToggle) {
-                    eventHandlers.onSummaryDetailToggle(!isDetailedSummary);
-                }
-            });
-        }
-        
-        // 发送用户问题
-        function sendQuestion() {
-            const question = document.getElementById('user-question').value.trim();
-            if (question && eventHandlers.onUserQuestion) {
-                eventHandlers.onUserQuestion(question);
-                document.getElementById('user-question').value = '';
-            }
-        }
-        
-        // 设置激活标签
-        function setActiveTab(tabName) {
-            if (!dialogContainer) return;
-            
-            // 更新全局变量
-            activeTab = tabName;
-            
-            // 更新标签按钮状态
-            document.querySelectorAll('.tab-button').forEach(button => {
-                button.classList.toggle('active', button.dataset.tab === tabName);
-            });
-            
-            // 更新标签内容显示
-            document.querySelectorAll('.tab-content').forEach(content => {
-                content.classList.toggle('active', content.id === `${tabName}-tab`);
-            });
-        }
-        
-        // 显示对话框
-        function showDialog() {
-            if (!dialogContainer) createDialog();
-            dialogContainer.style.display = 'flex';
-        }
-        
-        // 显示加载状态
-        function showLoadingState() {
-            showDialog();
-            
-            const summaryContent = document.getElementById('summary-content');
-            summaryContent.innerHTML = '<div class="loading-spinner"></div><p>正在分析内容，请稍候...</p>';
-            
-            const keypointsContainer = document.getElementById('keypoints-container');
-            keypointsContainer.innerHTML = '<div class="loading-spinner"></div><p>提取关键要点中...</p>';
-        }
-        
-        // 显示获取更详细摘要的加载状态
-        function showMoreDetailedLoading() {
-            const summaryContent = document.getElementById('summary-content');
-            const actionDiv = document.querySelector('.summary-actions');
-            
-            if (actionDiv) {
-                actionDiv.innerHTML = '<div class="loading-spinner small"></div> 获取' + 
-                    (isDetailedSummary ? '简短' : '详细') + '摘要中...';
-            }
-        }
-        
-        // 显示总结内容
-        function displaySummary(summary, detailed = false) {
-            const summaryContent = document.getElementById('summary-content');
-            if (!summaryContent) return;
-            
-            // 保存状态
-            isDetailedSummary = detailed;
-            
-            // 显示摘要内容
-            summaryContent.innerHTML = formatMarkdown(summary);
-            
-            // 更新按钮文本
-            const actionDiv = document.querySelector('.summary-actions');
-            if (actionDiv) {
-                actionDiv.innerHTML = `
-                    <button id="${detailed ? 'less-detailed-btn' : 'more-detailed-btn'}" class="summary-button">
-                        查看${detailed ? '简短' : '更详细'}摘要
-                    </button>
-                `;
-                
-                // 绑定事件
-                document.getElementById(detailed ? 'less-detailed-btn' : 'more-detailed-btn')
-                    .addEventListener('click', () => {
-                        if (eventHandlers.onSummaryDetailToggle) {
-                            eventHandlers.onSummaryDetailToggle(!detailed);
-                        }
-                    });
-            }
-        }
-        
-        // 显示关键要点
-        function displayKeypoints(keypointsData) {
-            const keypointsContainer = document.getElementById('keypoints-container');
-            const suggestedQuestions = document.getElementById('suggested-questions');
-            
-            if (!keypointsContainer || !suggestedQuestions) return;
-            
-            try {
-                // 解析JSON（如果是字符串）
-                let data = keypointsData;
-                if (typeof keypointsData === 'string') {
-                    data = JSON.parse(keypointsData);
-                }
-                
-                // 显示关键要点
-                if (data.keypoints && Array.isArray(data.keypoints)) {
-                    keypointsContainer.innerHTML = '';
-                    
-                    data.keypoints.forEach((keypoint, index) => {
-                        const keypointCard = document.createElement('div');
-                        keypointCard.className = 'keypoint-card';
-                        keypointCard.innerHTML = `
-                            <div class="keypoint-title">
-                                ${keypoint.title || `要点 ${index + 1}`}
-                                <span class="keypoint-toggle">展开</span>
-                            </div>
-                            <div class="keypoint-detail">${keypoint.detail || ''}</div>
-                        `;
-                        
-                        // 添加展开/折叠功能
-                        keypointCard.addEventListener('click', () => {
-                            keypointCard.classList.toggle('expanded');
-                            const toggle = keypointCard.querySelector('.keypoint-toggle');
-                            toggle.textContent = keypointCard.classList.contains('expanded') ? '折叠' : '展开';
-                        });
-                        
-                        keypointsContainer.appendChild(keypointCard);
-                    });
-                } else {
-                    keypointsContainer.innerHTML = '<p>无法获取关键要点</p>';
-                }
-                
-                // 显示推荐问题
-                if (data.suggestedQuestions && Array.isArray(data.suggestedQuestions)) {
-                    suggestedQuestions.innerHTML = '';
-                    
-                    data.suggestedQuestions.forEach(question => {
-                        const button = document.createElement('button');
-                        button.className = 'suggested-question-button';
-                        button.textContent = question;
-                        
-                        // 点击问题自动切换到对话标签
-                        button.addEventListener('click', () => {
-                            if (eventHandlers.onUserQuestion) {
-                                setActiveTab('conversation');
-                                eventHandlers.onUserQuestion(question);
-                            }
-                        });
-                        
-                        suggestedQuestions.appendChild(button);
-                    });
-                } else {
-                    suggestedQuestions.innerHTML = '<p>无推荐问题</p>';
-                }
-                
-            } catch (error) {
-                console.error('解析关键要点数据失败:', error);
-                keypointsContainer.innerHTML = '<p>解析关键要点数据失败</p>';
-            }
-        }
-        
-        // 显示问题加载状态
-        function showQuestionLoading(question) {
-            const conversationContainer = document.getElementById('conversation-container');
-            if (!conversationContainer) return;
-            
-            // 创建用户问题元素
-            const questionEl = document.createElement('div');
-            questionEl.className = 'user-question';
-            questionEl.textContent = question;
-            
-            // 创建加载中元素
-            const loadingEl = document.createElement('div');
-            loadingEl.className = 'ai-answer loading';
-            loadingEl.innerHTML = '<div class="loading-spinner small"></div> 思考中...';
-            loadingEl.id = 'current-loading';
-            
-            // 添加到对话容器
-            conversationContainer.appendChild(questionEl);
-            conversationContainer.appendChild(loadingEl);
-            
-            // 滚动到底部
-            conversationContainer.scrollTop = conversationContainer.scrollHeight;
-        }
-        
-        // 显示回答
-        function displayAnswer(question, answer) {
-            const conversationContainer = document.getElementById('conversation-container');
-            if (!conversationContainer) return;
-            
-            // 移除之前的加载中状态
-            const loadingEl = document.getElementById('current-loading');
-            if (loadingEl) {
-                conversationContainer.removeChild(loadingEl);
-            }
-            
-            // 如果问题元素不存在，创建问题元素
-            if (!document.querySelector(`.user-question:last-child[data-question="${encodeURIComponent(question)}"]`)) {
-                const questionEl = document.createElement('div');
-                questionEl.className = 'user-question';
-                questionEl.textContent = question;
-                questionEl.dataset.question = encodeURIComponent(question);
-                conversationContainer.appendChild(questionEl);
-            }
-            
-            // 创建回答元素
-            const answerEl = document.createElement('div');
-            answerEl.className = 'ai-answer';
-            answerEl.innerHTML = formatMarkdown(answer);
-            
-            // 添加到对话容器
-            conversationContainer.appendChild(answerEl);
-            
-            // 滚动到底部
-            conversationContainer.scrollTop = conversationContainer.scrollHeight;
-        }
-        
-        // 最小化对话框
-        function minimizeDialog() {
-            if (dialogContainer) {
-                dialogContainer.style.display = 'none';
-                
-                // 如果最小化图标不存在则创建
-                if (!minimizedIcon) {
-                    minimizedIcon = document.createElement('div');
-                    minimizedIcon.id = 'ai-minimized-icon';
-                    minimizedIcon.className = 'ai-minimized-icon';
-                    minimizedIcon.innerHTML = 'AI';
-                    minimizedIcon.addEventListener('click', maximizeDialog);
-                    document.body.appendChild(minimizedIcon);
-                } else {
-                    minimizedIcon.style.display = 'flex';
-                }
-            }
-        }
-        
-        // 最大化对话框
-        function maximizeDialog() {
-            if (dialogContainer) {
-                dialogContainer.style.display = 'flex';
-                if (minimizedIcon) minimizedIcon.style.display = 'none';
-            } else {
-                createDialog();
-            }
-        }
-        
-        // 关闭对话框
-        function closeDialog() {
-            if (dialogContainer) {
-                dialogContainer.style.display = 'none';
-                if (minimizedIcon) minimizedIcon.style.display = 'none';
-            }
-        }
-        
-        // 显示错误信息
-        function showError(message) {
-            if (!dialogContainer) createDialog();
-            
-            const activeContent = document.querySelector('.tab-content.active');
-            if (activeContent) {
-                const errorElement = document.createElement('div');
-                errorElement.className = 'error-message';
-                errorElement.textContent = message;
-                
-                // 清除现有内容并显示错误
-                activeContent.innerHTML = '';
-                activeContent.appendChild(errorElement);
-            }
-        }
-        
-        // 格式化Markdown内容
-        function formatMarkdown(text) {
-            if (!text) return '';
-            
-            // 将Markdown语法转换为HTML
-            let html = text
-                // 换行符处理
-                .replace(/\n\n/g, '</p><p>')
-                // 加粗
-                .replace(/\*\*(.*?)\*\*/g, '<span class="md-bold">$1</span>')
-                // 斜体
-                .replace(/\*(.*?)\*/g, '<span class="md-italic">$1</span>')
-                // 下划线
-                .replace(/__(.*?)__/g, '<span class="md-underline">$1</span>')
-                // 高亮
-                .replace(/==(.*?)==/g, '<span class="md-highlight">$1</span>')
-                // 行内代码
-                .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>')
-                // 引用块
-                .replace(/^\>(.*)/gm, '<div class="md-blockquote">$1</div>')
-                // 链接
-                .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" class="md-link" target="_blank">$1</a>')
-                // 列表项
-                .replace(/^[\*\-] (.*)/gm, '<div class="md-list-item">$1</div>');
-            
-            // 确保所有内容都在<p>标签中
-            html = `<p>${html}</p>`;
-            
-            return html;
-        }
-        
-        // 尝试恢复会话状态
-        function tryRestoreSessionState() {
-            const savedTab = SessionManager.getSession(SESSION_KEYS.ACTIVE_TAB);
-            if (savedTab) {
-                setActiveTab(savedTab);
-            }
-            
-            restoreAllTabs();
-        }
-        
-        // 恢复所有标签页内容
-        function restoreAllTabs() {
-            showDialog();
-            
-            // 恢复摘要内容
-            const summary = SessionManager.getSession(SESSION_KEYS.SUMMARY);
-            if (summary) {
-                displaySummary(summary, false); // 默认显示简短摘要
-            }
-            
-            // 恢复关键要点
-            const keypoints = SessionManager.getSession(SESSION_KEYS.KEYPOINTS);
-            if (keypoints) {
-                displayKeypoints(keypoints);
-            }
-            
-            // 恢复对话历史
-            const conversations = SessionManager.getSession(SESSION_KEYS.CONVERSATION);
-            if (conversations && Array.isArray(conversations)) {
-                restoreConversationHistory(conversations);
-            }
-        }
-        
-        // 恢复对话历史
-        function restoreConversationHistory(conversations) {
-            const container = document.getElementById('conversation-container');
-            if (!container) return;
-            
-            // 清空现有内容
-            container.innerHTML = '';
-            
-            // 添加历史对话
-            conversations.forEach(item => {
-                displayAnswer(item.question, item.answer);
-            });
-        }
-        
-        // 事件处理器存储
-        let eventHandlers = {
-            onSummarizeClick: () => {},
-            onUserQuestion: () => {},
-            onSummaryDetailToggle: () => {},
-            onTabChange: () => {}
-        };
-        
-        // 注册事件
-        function registerEvents(handlers) {
-            eventHandlers = { ...eventHandlers, ...handlers };
-            
-            // 注册总结按钮点击事件
-            if (summaryButton) {
-                summaryButton.addEventListener('click', eventHandlers.onSummarizeClick);
-            }
-        }
-        
-        // 返回公共API
-        return {
-            initialize,
-            showDialog,
-            showLoadingState,
-            showMoreDetailedLoading,
-            displaySummary,
-            displayKeypoints,
-            displayAnswer,
-            minimizeDialog,
-            showError,
-            showQuestionLoading,
-            setActiveTab,
-            registerEvents,
-            tryRestoreSessionState,
-            restoreAllTabs
-        };
-    })();
- 
     /**
      * ====================================================
      * 3. 内容提取器
      * ====================================================
      */
     const ContentExtractor = (function() {
+        // 内容提取器缓存
+        let cachedContent = null;
+
         // 提取文本网页内容
         async function extractTextContent() {
             try {
+                // 检查缓存
+                if (cachedContent) {
+                    console.log('使用缓存的内容');
+                    return cachedContent;
+                }
+
                 // 获取主要内容
                 const mainContent = getMainContent();
                 
                 // 清洗内容，移除广告、导航等干扰元素
                 const cleanedContent = cleanContent(mainContent);
+                
+                // 缓存结果
+                cachedContent = cleanedContent;
                 
                 return cleanedContent;
             } catch (error) {
@@ -1342,63 +341,194 @@
         // 提取视频网站内容
         async function extractVideoContent() {
             try {
+                // 检查缓存
+                if (cachedContent) {
+                    console.log('使用缓存的视频内容');
+                    return cachedContent;
+                }
+
                 // 获取当前视频网站类型
                 const siteType = detectVideoSite();
                 
                 // 根据不同网站调用不同的提取方法
+                let content;
                 switch (siteType) {
                     case 'youtube':
-                        return extractYouTubeContent();
+                        content = await extractYouTubeContent();
+                        break;
                     case 'bilibili':
-                        return extractBilibiliContent();
+                        content = await extractBilibiliContent();
+                        break;
                     case 'vimeo':
-                        return extractVimeoContent();
+                        content = await extractVimeoContent();
+                        break;
                     default:
                         throw new Error('不支持的视频网站');
                 }
+                
+                // 缓存结果
+                cachedContent = content;
+                
+                return content;
             } catch (error) {
                 console.error('提取视频内容失败:', error);
                 throw new Error('无法提取视频内容: ' + error.message);
             }
         }
         
-        // 获取页面主要内容
+        // 重置缓存
+        function resetCache() {
+            cachedContent = null;
+        }
+        
+        // 获取页面主要内容 - 增强版
         function getMainContent() {
-            // 尝试使用常见的内容容器选择器
-            const contentSelectors = [
+            // 1. 首先尝试通过语义标签查找内容
+            const semanticSelectors = [
                 'article',
+                'main',
                 '[role="main"]',
-                '.main-content',
-                '#content',
-                '.post-content',
+                '[itemprop="articleBody"]',
                 '.article-content',
-                '.entry-content',
-                '.content',
-                '#main'
+                '.post-content',
+                '.entry-content'
             ];
             
-            // 尝试每个选择器，找到内容最多的元素
-            let bestElement = null;
-            let maxTextLength = 0;
-            
-            for (const selector of contentSelectors) {
+            // 尝试语义选择器
+            for (const selector of semanticSelectors) {
                 const elements = document.querySelectorAll(selector);
-                
-                for (const element of elements) {
-                    const textLength = element.textContent.trim().length;
-                    if (textLength > maxTextLength) {
-                        maxTextLength = textLength;
-                        bestElement = element;
+                if (elements.length > 0) {
+                    // 如果找到多个，选择内容最多的
+                    let bestElement = elements[0];
+                    let maxLength = elements[0].textContent.trim().length;
+                    
+                    for (let i = 1; i < elements.length; i++) {
+                        const length = elements[i].textContent.trim().length;
+                        if (length > maxLength) {
+                            maxLength = length;
+                            bestElement = elements[i];
+                        }
+                    }
+                    
+                    // 如果找到的内容足够长，直接返回
+                    if (maxLength > 1000) {
+                        return bestElement.innerText;
                     }
                 }
             }
             
-            // 如果没有找到特定容器，则使用启发式方法
-            if (!bestElement || maxTextLength < 1000) {
-                bestElement = findContentHeuristically();
+            // 2. 接下来尝试通过内容密度查找
+            const contentContainer = findContentByDensity();
+            if (contentContainer && contentContainer.textContent.trim().length > 1000) {
+                return contentContainer.innerText;
             }
             
-            return bestElement ? bestElement.innerText : document.body.innerText;
+            // 3. 最后尝试启发式方法查找内容
+            const heuristicContent = findContentHeuristically();
+            if (heuristicContent) {
+                return heuristicContent.innerText;
+            }
+            
+            // 4. 如果以上都失败，返回处理过的body内容
+            return processBodyContent();
+        }
+        
+        // 通过内容密度查找主要内容
+        function findContentByDensity() {
+            // 获取所有可能的内容容器
+            const potentialContainers = document.querySelectorAll('div, section, main');
+            
+            // 计算每个容器的文本密度得分
+            let bestContainer = null;
+            let bestScore = 0;
+            
+            for (const container of potentialContainers) {
+                // 只考虑可见的、不是导航/侧边栏/页脚的元素
+                if (isElementHidden(container) || 
+                    isNavigationElement(container) || 
+                    isFooterElement(container)) {
+                    continue;
+                }
+                
+                const text = container.textContent.trim();
+                const textLength = text.length;
+                
+                if (textLength < 500) continue; // 忽略太短的内容
+                
+                // 计算文本密度 (文本长度 / HTML长度)
+                const htmlLength = container.innerHTML.length;
+                const textDensity = htmlLength > 0 ? textLength / htmlLength : 0;
+                
+                // 计算段落密度 (段落数 / 总文本长度)
+                const paragraphs = container.querySelectorAll('p');
+                const paragraphDensity = paragraphs.length / (textLength / 1000);
+                
+                // 结合各种因素计算最终得分
+                const linkRatio = calculateLinkRatio(container);
+                const score = textDensity * 0.4 + paragraphDensity * 0.4 + (1 - linkRatio) * 0.2;
+                
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestContainer = container;
+                }
+            }
+            
+            return bestContainer;
+        }
+        
+        // 计算元素中链接文本占总文本的比例
+        function calculateLinkRatio(element) {
+            const totalText = element.textContent.trim().length;
+            if (totalText === 0) return 1; // 防止除以零
+            
+            let linkText = 0;
+            const links = element.querySelectorAll('a');
+            for (const link of links) {
+                linkText += link.textContent.trim().length;
+            }
+            
+            return linkText / totalText;
+        }
+        
+        // 检查元素是否隐藏
+        function isElementHidden(element) {
+            const style = window.getComputedStyle(element);
+            return style.display === 'none' || 
+                   style.visibility === 'hidden' || 
+                   style.opacity === '0' ||
+                   element.offsetHeight === 0;
+        }
+        
+        // 检查是否为导航元素
+        function isNavigationElement(element) {
+            const navTerms = ['nav', 'menu', 'navigation', 'navbar', 'header', 'site-header'];
+            
+            // 检查元素的ID、类名和角色
+            const id = element.id.toLowerCase();
+            const className = element.className.toLowerCase();
+            const role = element.getAttribute('role');
+            
+            // 检查是否包含导航相关词汇
+            return navTerms.some(term => 
+                id.includes(term) || 
+                className.includes(term) || 
+                (role && role.includes(term)) || 
+                element.tagName.toLowerCase() === 'nav'
+            );
+        }
+        
+        // 检查是否为页脚元素
+        function isFooterElement(element) {
+            const footerTerms = ['footer', 'bottom', 'copyright'];
+            
+            const id = element.id.toLowerCase();
+            const className = element.className.toLowerCase();
+            
+            return footerTerms.some(term => 
+                id.includes(term) || 
+                className.includes(term) || 
+                element.tagName.toLowerCase() === 'footer'
+            );
         }
         
         // 使用启发式方法查找内容
@@ -1415,6 +545,11 @@
             const containers = new Map();
             
             for (const p of paragraphs) {
+                // 跳过空段落或隐藏段落
+                if (p.textContent.trim().length === 0 || isElementHidden(p)) {
+                    continue;
+                }
+                
                 // 向上遍历5层，寻找共同容器
                 let parent = p.parentElement;
                 let depth = 0;
@@ -1429,13 +564,20 @@
                 }
             }
             
-            // 找出包含最多段落的容器
+            // 找出包含最多段落的容器，同时考虑层级因素
             let bestContainer = null;
-            let maxParagraphs = 0;
+            let maxScore = 0;
             
             for (const [container, count] of containers.entries()) {
-                if (count > maxParagraphs) {
-                    maxParagraphs = count;
+                // 计算深度级别 (倾向于选择更具体的容器)
+                const depth = getElementDepth(container);
+                // 结合段落数和深度的得分
+                const score = count * (1 + Math.min(depth, 10) / 20);
+                
+                if (score > maxScore && 
+                    !isNavigationElement(container) && 
+                    !isFooterElement(container)) {
+                    maxScore = score;
                     bestContainer = container;
                 }
             }
@@ -1443,14 +585,46 @@
             return bestContainer;
         }
         
+        // 获取元素在DOM树中的深度
+        function getElementDepth(element) {
+            let depth = 0;
+            let current = element;
+            
+            while (current && current !== document.body) {
+                depth++;
+                current = current.parentElement;
+            }
+            
+            return depth;
+        }
+        
+        // 处理整个body内容
+        function processBodyContent() {
+            // 创建一个body的副本
+            const bodyClone = document.body.cloneNode(true);
+            
+            // 移除scripts, styles, navs, headers, footers等
+            const elementsToRemove = bodyClone.querySelectorAll('script, style, nav, header, footer, aside, [role="banner"], [role="navigation"], [role="complementary"], .sidebar, .menu, .nav, .navigation, .header, .footer');
+            elementsToRemove.forEach(el => el.remove());
+            
+            // 返回处理后的文本
+            return bodyClone.innerText;
+        }
+        
         // 清洗内容
         function cleanContent(content) {
             if (!content) return '';
             
-            // 移除多余空白
-            let cleaned = content.replace(/\s+/g, ' ').trim();
+            // 1. 基本清理: 移除多余空白并限制内容长度
+            let cleaned = content
+                .replace(/\s+/g, ' ')  // 将连续空白字符替换为单个空格
+                .trim();
             
-            // 移除常见的干扰文本模式
+            // 2. 移除URL和电子邮件地址
+            cleaned = cleaned.replace(/https?:\/\/\S+/g, ' ')
+                            .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, ' ');
+            
+            // 3. 移除常见的干扰文本模式
             const noisePatterns = [
                 /Cookie Policy/gi,
                 /Terms of Service/gi,
@@ -1461,14 +635,57 @@
                 /Related Articles/gi,
                 /More From/gi,
                 /Read More/gi,
-                /Loading\.\.\./gi
+                /Loading\.\.\./gi,
+                /Subscribe to/gi,
+                /Sign up for/gi,
+                /Follow us/gi,
+                /Advertisement/gi
             ];
             
             for (const pattern of noisePatterns) {
                 cleaned = cleaned.replace(pattern, '');
             }
             
+            // 4. 清理连续重复的句子或段落
+            cleaned = removeRepeatedContent(cleaned);
+            
+            // 5. 限制内容长度 (防止过长内容)
+            const maxContentLength = 16000;
+            if (cleaned.length > maxContentLength) {
+                // 保留前70%和后30%的内容
+                const frontPart = cleaned.slice(0, maxContentLength * 0.7);
+                const backPart = cleaned.slice(cleaned.length - maxContentLength * 0.3);
+                cleaned = frontPart + '\n...[内容过长已省略部分]...\n' + backPart;
+            }
+            
             return cleaned;
+        }
+        
+        // 移除重复内容
+        function removeRepeatedContent(text) {
+            // 将文本分割成句子
+            const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
+            
+            // 如果句子太少，不需要处理
+            if (sentences.length < 10) return text;
+            
+            // 创建一个新数组存储不重复的句子
+            const uniqueSentences = [];
+            const sentenceMap = new Map();
+            
+            for (const sentence of sentences) {
+                // 标准化句子以便比较
+                const normalizedSentence = sentence.trim().toLowerCase();
+                
+                // 如果句子太短，或者是第一次出现，则保留
+                if (normalizedSentence.length < 20 || !sentenceMap.has(normalizedSentence)) {
+                    uniqueSentences.push(sentence);
+                    sentenceMap.set(normalizedSentence, true);
+                }
+            }
+            
+            // 重新组合句子
+            return uniqueSentences.join('');
         }
         
         // 检测视频网站类型
@@ -1504,35 +721,188 @@
             return 'unknown';
         }
         
-        // 提取YouTube内容
+        // 提取YouTube内容 - 使用多层选择器和备用策略
         async function extractYouTubeContent() {
             try {
-                // 获取视频标题
-                const title = document.querySelector('h1.title, h1[class*="title"]')?.textContent.trim() || '';
+                // 视频信息对象
+                const videoInfo = {
+                    title: '',
+                    channelName: '',
+                    uploadDate: '',
+                    description: '',
+                    category: '',
+                    stats: '',
+                    captions: ''
+                };
                 
-                // 获取频道名称
-                const channelName = document.querySelector('[class*="channel-name"], [class*="owner-name"]')?.textContent.trim() || '';
+                // 通用查找函数 - 尝试多个选择器并返回第一个找到的内容
+                function findContent(selectors, defaultValue = '') {
+                    for (const selector of selectors) {
+                        try {
+                            const element = document.querySelector(selector);
+                            if (element && element.textContent.trim()) {
+                                return element.textContent.trim();
+                            }
+                        } catch (e) {
+                            console.log(`选择器 ${selector} 查找失败:`, e);
+                        }
+                    }
+                    return defaultValue;
+                }
                 
-                // 获取视频上传时间
-                const uploadDate = document.querySelector('[class*="date"]')?.textContent.trim() || '';
+                // 提取标题 - 使用多层选择器
+                const titleSelectors = [
+                    'h1.title', 
+                    'h1[class*="title"]',
+                    '#title h1',
+                    '#title',
+                    '#container h1',
+                    'h1.ytd-video-primary-info-renderer',
+                    // 通用备用选择器
+                    'h1',
+                    'title', // 页面标题通常包含视频标题
+                    'meta[property="og:title"]', // OpenGraph标题
+                    'meta[name="title"]'
+                ];
                 
-                // 获取视频描述
-                const description = document.querySelector('#description-inline-expander, [class*="description"]')?.textContent.trim() || '';
+                videoInfo.title = findContent(titleSelectors, '未能获取标题');
+                
+                // 如果依然无法获取标题，尝试从页面标题或meta标签获取
+                if (videoInfo.title === '未能获取标题') {
+                    // 尝试从document.title获取
+                    const pageTitle = document.title.replace(' - YouTube', '').trim();
+                    if (pageTitle) {
+                        videoInfo.title = pageTitle;
+                    } else {
+                        // 尝试从meta标签获取
+                        const metaTitle = document.querySelector('meta[property="og:title"]');
+                        if (metaTitle && metaTitle.getAttribute('content')) {
+                            videoInfo.title = metaTitle.getAttribute('content');
+                        }
+                    }
+                }
+                
+                // 提取频道名称
+                const channelSelectors = [
+                    '[class*="channel-name"]', 
+                    '[class*="owner-name"]',
+                    '#owner-name a',
+                    '#channel-name',
+                    '.ytd-channel-name',
+                    // 通用备用选择器
+                    'meta[property="og:site_name"]',
+                    'meta[name="author"]',
+                    '[class*="author"]',
+                    '[class*="creator"]'
+                ];
+                
+                videoInfo.channelName = findContent(channelSelectors);
+                
+                // 提取上传日期
+                const dateSelectors = [
+                    '[class*="date"]',
+                    '#date',
+                    '#info-strings yt-formatted-string',
+                    '.ytd-video-primary-info-renderer #info',
+                    // 通用备用选择器
+                    'meta[itemprop="datePublished"]',
+                    'meta[property="article:published_time"]',
+                    '[class*="publish"]',
+                    '[class*="upload"]'
+                ];
+                
+                videoInfo.uploadDate = findContent(dateSelectors);
+                
+                // 提取视频描述
+                const descriptionSelectors = [
+                    '#description-inline-expander', 
+                    '[class*="description"]',
+                    '#description',
+                    '#meta-contents #description',
+                    // 通用备用选择器
+                    'meta[property="og:description"]',
+                    'meta[name="description"]',
+                    '[class*="desc"]',
+                    '[class*="info"]'
+                ];
+                
+                videoInfo.description = findContent(descriptionSelectors);
+                
+                // 如果仍然没有描述，尝试从meta标签获取
+                if (!videoInfo.description) {
+                    const metaDesc = document.querySelector('meta[property="og:description"]');
+                    if (metaDesc && metaDesc.getAttribute('content')) {
+                        videoInfo.description = metaDesc.getAttribute('content');
+                    }
+                }
+                
+                // 提取分类和标签
+                const categorySelectors = ['#additional-info-items'];
+                videoInfo.category = findContent(categorySelectors);
+                
+                // 提取视频统计信息
+                const statsSelectors = ['#info-text', '#count', '.view-count'];
+                videoInfo.stats = findContent(statsSelectors);
                 
                 // 尝试获取字幕
-                const captions = await getYouTubeCaptions();
+                try {
+                    videoInfo.captions = await getYouTubeCaptions();
+                } catch (e) {
+                    console.log('获取字幕失败:', e);
+                    videoInfo.captions = '无法获取字幕';
+                    
+                    // 尝试获取评论作为备用
+                    try {
+                        const comments = getYouTubeComments();
+                        if (comments && comments.length > 0) {
+                            videoInfo.captions = '无法获取字幕，以下是部分评论:\n' + comments.join('\n');
+                        }
+                    } catch (commentError) {
+                        console.log('获取评论失败:', commentError);
+                    }
+                }
                 
                 // 整合视频信息
-                let videoInfo = `视频标题: ${title}\n\n`;
-                if (channelName) videoInfo += `频道: ${channelName}\n\n`;
-                if (uploadDate) videoInfo += `上传时间: ${uploadDate}\n\n`;
-                if (description) videoInfo += `视频描述: ${description}\n\n`;
-                videoInfo += `字幕内容: ${captions}`;
+                let formattedInfo = `视频标题: ${videoInfo.title}\n\n`;
+                if (videoInfo.channelName) formattedInfo += `频道: ${videoInfo.channelName}\n\n`;
+                if (videoInfo.uploadDate) formattedInfo += `上传时间: ${videoInfo.uploadDate}\n\n`;
+                if (videoInfo.stats) formattedInfo += `统计信息: ${videoInfo.stats}\n\n`;
+                if (videoInfo.category) formattedInfo += `分类: ${videoInfo.category}\n\n`;
+                if (videoInfo.description) formattedInfo += `视频描述: ${videoInfo.description}\n\n`;
+                formattedInfo += `字幕内容: ${videoInfo.captions || '无法获取字幕'}\n\n`;
                 
-                return videoInfo;
+                // 检查提取的信息是否足够
+                if (!videoInfo.title && !videoInfo.description) {
+                    throw new Error('无法提取足够的视频信息，请尝试刷新页面');
+                }
+                
+                // 清理内容中的冗余信息
+                return cleanContent(formattedInfo);
+                
             } catch (error) {
                 console.error('提取YouTube内容失败:', error);
-                throw new Error('无法提取YouTube视频信息: ' + error.message);
+                
+                // 尝试最后的备用方法 - 直接提取页面元数据
+                try {
+                    const title = document.title.replace(' - YouTube', '').trim();
+                    let description = '';
+                    const metaDesc = document.querySelector('meta[property="og:description"]');
+                    if (metaDesc) {
+                        description = metaDesc.getAttribute('content') || '';
+                    }
+                    
+                    if (title || description) {
+                        let fallbackInfo = `视频标题: ${title || '未知'}\n\n`;
+                        if (description) fallbackInfo += `视频描述: ${description}\n\n`;
+                        fallbackInfo += '无法获取更多视频详情，请尝试刷新页面后再试。';
+                        
+                        return fallbackInfo;
+                    }
+                } catch (fallbackError) {
+                    console.error('备用方法也失败:', fallbackError);
+                }
+                
+                throw error;
             }
         }
         
@@ -1574,6 +944,12 @@
                     }
                 }
                 
+                // 尝试从视频描述或评论中获取更多上下文
+                const comments = getYouTubeComments();
+                if (comments && comments.length > 0) {
+                    return '无法获取字幕，以下是部分热门评论:\n' + comments.join('\n');
+                }
+                
                 return '由于浏览器扩展权限限制，无法获取完整字幕内容。请使用视频标题、描述和其他元数据进行总结。';
                 
             } catch (error) {
@@ -1582,68 +958,329 @@
             }
         }
         
-        // 提取Bilibili内容
-        async function extractBilibiliContent() {
+        // 获取YouTube评论
+        function getYouTubeComments() {
             try {
-                // 获取视频标题
-                const title = document.querySelector('.video-title, .media-title')?.textContent.trim() || '';
+                // 尝试多个评论选择器
+                const commentSelectors = [
+                    'ytd-comment-renderer #content-text',
+                    '#comment-content',
+                    '[id^="comment-"] .comment-text',
+                    '.comment-renderer-text-content',
+                    // 通用备用选择器
+                    '[class*="comment"] [class*="content"]',
+                    '[class*="comment"] [class*="text"]'
+                ];
                 
-                // 获取UP主信息
-                const uploader = document.querySelector('.up-name, .up-info-v1-name')?.textContent.trim() || '';
+                let commentsFound = [];
                 
-                // 获取视频描述
-                const description = document.querySelector('.desc-info, .media-desc')?.textContent.trim() || '';
-                
-                // 获取视频发布时间
-                const publishTime = document.querySelector('.video-data-time, .pudate-text, .pubdate-text')?.textContent.trim() || '';
-                
-                // 获取视频分区和标签
-                const category = document.querySelector('.av-link')?.textContent.trim() || '';
-                const tags = Array.from(document.querySelectorAll('.tag-link')).map(tag => tag.textContent.trim()).join(', ');
-                
-                // 尝试获取弹幕或字幕
-                const subtitles = await getBilibiliSubtitles();
-                
-                // 整合视频信息
-                let videoInfo = `视频标题: ${title}\n\n`;
-                if (uploader) videoInfo += `UP主: ${uploader}\n\n`;
-                if (publishTime) videoInfo += `发布时间: ${publishTime}\n\n`;
-                if (category) videoInfo += `分区: ${category}\n\n`;
-                if (tags) videoInfo += `标签: ${tags}\n\n`;
-                if (description) videoInfo += `视频简介: ${description}\n\n`;
-                videoInfo += `字幕/弹幕内容: ${subtitles}`;
-                
-                return videoInfo;
-            } catch (error) {
-                console.error('提取Bilibili内容失败:', error);
-                throw new Error('无法提取Bilibili视频信息: ' + error.message);
-            }
-        }
-        
-        // 获取Bilibili字幕或弹幕
-        async function getBilibiliSubtitles() {
-            try {
-                // 检查是否有字幕按钮
-                const hasSubtitle = document.querySelector('.bilibili-player-video-btn-subtitle');
-                if (hasSubtitle) {
-                    // 获取显示的字幕内容
-                    const subtitleDisplay = document.querySelector('.bilibili-player-video-subtitle');
-                    if (subtitleDisplay && subtitleDisplay.textContent.trim()) {
-                        return subtitleDisplay.textContent.trim();
+                // 尝试每个选择器
+                for (const selector of commentSelectors) {
+                    const elements = document.querySelectorAll(selector);
+                    if (elements && elements.length > 0) {
+                        // 获取前5条评论
+                        const maxComments = Math.min(5, elements.length);
+                        for (let i = 0; i < maxComments; i++) {
+                            const text = elements[i].textContent.trim();
+                            if (text && text.length > 10) {
+                                commentsFound.push(`评论${i+1}: ${text}`);
+                            }
+                        }
+                        
+                        if (commentsFound.length > 0) {
+                            break; // 找到评论后停止尝试其他选择器
+                        }
                     }
                 }
                 
-                // 尝试获取弹幕
-                const danmakuElements = document.querySelectorAll('.bilibili-player-danmaku');
+                return commentsFound.length > 0 ? commentsFound : null;
+            } catch (error) {
+                console.error('获取YouTube评论失败:', error);
+                return null;
+            }
+        }
+        
+        // 提取Bilibili内容 - 使用增强的选择器和备用策略
+        async function extractBilibiliContent() {
+            try {
+                // 视频信息对象
+                const videoInfo = {
+                    title: '',
+                    uploader: '',
+                    description: '',
+                    publishTime: '',
+                    category: '',
+                    tags: '',
+                    subtitles: ''
+                };
+                
+                // 通用查找函数 - 尝试多个选择器并返回第一个找到的内容
+                function findContent(selectors, defaultValue = '') {
+                    for (const selector of selectors) {
+                        try {
+                            const element = document.querySelector(selector);
+                            if (element && element.textContent.trim()) {
+                                return element.textContent.trim();
+                            }
+                        } catch (e) {
+                            console.log(`选择器 ${selector} 查找失败:`, e);
+                        }
+                    }
+                    return defaultValue;
+                }
+                
+                // 提取标题 - 使用多层选择器
+                const titleSelectors = [
+                    '.video-title', 
+                    '.media-title',
+                    'h1[title]',
+                    '.tit',
+                    '.title',
+                    'h1', // 通用标题标签
+                    'meta[property="og:title"]', // OpenGraph标题
+                    'meta[name="title"]' // 通用meta标题
+                ];
+                
+                videoInfo.title = findContent(titleSelectors, '未能获取标题');
+                
+                // 如果依然无法获取标题，尝试从页面标题或meta标签获取
+                if (videoInfo.title === '未能获取标题') {
+                    // 尝试从document.title获取
+                    const pageTitle = document.title.replace(/_哔哩哔哩_bilibili/i, '').trim();
+                    if (pageTitle) {
+                        videoInfo.title = pageTitle;
+                    } else {
+                        // 尝试从meta标签获取
+                        const metaTitle = document.querySelector('meta[property="og:title"]');
+                        if (metaTitle && metaTitle.getAttribute('content')) {
+                            videoInfo.title = metaTitle.getAttribute('content');
+                        }
+                    }
+                }
+                
+                // 提取UP主信息
+                const uploaderSelectors = [
+                    '.up-name', 
+                    '.up-info-v1-name',
+                    '.author-name',
+                    '.up a',
+                    '.username',
+                    'meta[name="author"]',
+                    '[class*="up"] [class*="name"]',
+                    '[class*="author"]'
+                ];
+                
+                videoInfo.uploader = findContent(uploaderSelectors);
+                
+                // 提取视频描述
+                const descriptionSelectors = [
+                    '.desc-info', 
+                    '.media-desc',
+                    '.desc-text',
+                    '#v_desc',
+                    '.desc',
+                    'meta[property="og:description"]',
+                    'meta[name="description"]',
+                    '[class*="desc"]'
+                ];
+                
+                videoInfo.description = findContent(descriptionSelectors);
+                
+                // 尝试从meta标签获取描述
+                if (!videoInfo.description) {
+                    const metaDesc = document.querySelector('meta[property="og:description"]');
+                    if (metaDesc && metaDesc.getAttribute('content')) {
+                        videoInfo.description = metaDesc.getAttribute('content');
+                    }
+                }
+                
+                // 提取视频发布时间
+                const publishTimeSelectors = [
+                    '.video-data-time', 
+                    '.pudate-text', 
+                    '.pubdate-text',
+                    '.pubdate',
+                    '.video-data span',
+                    'meta[itemprop="datePublished"]',
+                    '[class*="time"]',
+                    '[class*="date"]'
+                ];
+                
+                videoInfo.publishTime = findContent(publishTimeSelectors);
+                
+                // 提取视频分区
+                const categorySelectors = [
+                    '.av-link', 
+                    '.a-crumbs a', 
+                    '.video-data-list li:first-child',
+                    '[class*="crumb"]',
+                    '[class*="category"]'
+                ];
+                
+                videoInfo.category = findContent(categorySelectors);
+                
+                // 提取标签
+                const tagElements = document.querySelectorAll('.tag-link, .tag-item, .tag');
+                if (tagElements && tagElements.length > 0) {
+                    videoInfo.tags = Array.from(tagElements)
+                        .map(tag => tag.textContent.trim())
+                        .filter(tag => tag.length > 0)
+                        .join(', ');
+                } else {
+                    // 尝试其他可能的标签容器
+                    const tagContainerSelectors = [
+                        '.tag-container',
+                        '.video-tag',
+                        '[class*="tag"]'
+                    ];
+                    
+                    for (const selector of tagContainerSelectors) {
+                        const container = document.querySelector(selector);
+                        if (container) {
+                            const tags = Array.from(container.children)
+                                .map(el => el.textContent.trim())
+                                .filter(tag => tag.length > 0)
+                                .join(', ');
+                                
+                            if (tags) {
+                                videoInfo.tags = tags;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // 尝试获取弹幕或字幕
+                try {
+                    videoInfo.subtitles = await getBilibiliSubtitles();
+                } catch (e) {
+                    console.log('获取字幕失败:', e);
+                    videoInfo.subtitles = '无法获取字幕或弹幕';
+                    
+                    // 尝试获取评论作为备用
+                    try {
+                        const comments = getBilibiliComments();
+                        if (comments && comments.length > 0) {
+                            videoInfo.subtitles = '无法获取字幕/弹幕，以下是部分评论:\n' + comments.join('\n');
+                        }
+                    } catch (commentError) {
+                        console.log('获取评论失败:', commentError);
+                    }
+                }
+                
+                // 整合视频信息
+                let formattedInfo = `视频标题: ${videoInfo.title}\n\n`;
+                if (videoInfo.uploader) formattedInfo += `UP主: ${videoInfo.uploader}\n\n`;
+                if (videoInfo.publishTime) formattedInfo += `发布时间: ${videoInfo.publishTime}\n\n`;
+                if (videoInfo.category) formattedInfo += `分区: ${videoInfo.category}\n\n`;
+                if (videoInfo.tags) formattedInfo += `标签: ${videoInfo.tags}\n\n`;
+                if (videoInfo.description) formattedInfo += `视频简介: ${videoInfo.description}\n\n`;
+                formattedInfo += `字幕/弹幕内容: ${videoInfo.subtitles || '无法获取字幕或弹幕'}\n\n`;
+                
+                // 检查提取的信息是否足够
+                if (!videoInfo.title && !videoInfo.description) {
+                    throw new Error('无法提取足够的视频信息，请尝试刷新页面');
+                }
+                
+                // 清理内容中的冗余信息
+                return cleanContent(formattedInfo);
+                
+            } catch (error) {
+                console.error('提取Bilibili内容失败:', error);
+                
+                // 尝试最后的备用方法 - 直接提取页面元数据
+                try {
+                    const title = document.title.replace(/_哔哩哔哩_bilibili/i, '').trim();
+                    let description = '';
+                    const metaDesc = document.querySelector('meta[property="og:description"]');
+                    if (metaDesc) {
+                        description = metaDesc.getAttribute('content') || '';
+                    }
+                    
+                    if (title || description) {
+                        let fallbackInfo = `视频标题: ${title || '未知'}\n\n`;
+                        if (description) fallbackInfo += `视频简介: ${description}\n\n`;
+                        fallbackInfo += '无法获取更多视频详情，请尝试刷新页面后再试。';
+                        
+                        return fallbackInfo;
+                    }
+                } catch (fallbackError) {
+                    console.error('备用方法也失败:', fallbackError);
+                }
+                
+                throw error;
+            }
+        }
+        
+        // 获取Bilibili字幕或弹幕 - 增强版
+        async function getBilibiliSubtitles() {
+            try {
+                // 检查是否有字幕按钮 - 尝试多个选择器
+                const subtitleSelectors = [
+                    '.bilibili-player-video-btn-subtitle',
+                    '.bpx-player-subtitle-btn',
+                    '[class*="subtitle-btn"]'
+                ];
+                
+                let hasSubtitle = false;
+                for (const selector of subtitleSelectors) {
+                    const element = document.querySelector(selector);
+                    if (element) {
+                        hasSubtitle = true;
+                        break;
+                    }
+                }
+                
+                if (hasSubtitle) {
+                    // 尝试多个字幕内容选择器
+                    const subtitleContentSelectors = [
+                        '.bilibili-player-video-subtitle',
+                        '.bpx-player-subtitle',
+                        '[class*="subtitle"] span',
+                        '[class*="subtitle-content"]'
+                    ];
+                    
+                    for (const selector of subtitleContentSelectors) {
+                        const element = document.querySelector(selector);
+                        if (element && element.textContent.trim()) {
+                            return element.textContent.trim();
+                        }
+                    }
+                }
+                
+                // 尝试获取弹幕 - 使用多个选择器
+                const danmakuSelectors = [
+                    '.bilibili-player-danmaku', 
+                    '.b-danmaku', 
+                    '.danmaku-item',
+                    '[class*="danmaku"]',
+                    '[class*="barrageList"] [class*="item"]'
+                ];
+                
+                let danmakuElements = [];
+                for (const selector of danmakuSelectors) {
+                    const elements = document.querySelectorAll(selector);
+                    if (elements && elements.length > 0) {
+                        danmakuElements = elements;
+                        break;
+                    }
+                }
+                
                 if (danmakuElements && danmakuElements.length > 0) {
                     const danmakuTexts = Array.from(danmakuElements)
-                        .slice(0, 20) // 只获取前20条弹幕
+                        .slice(0, 30) // 获取前30条弹幕
                         .map(el => el.textContent.trim())
                         .filter(text => text.length > 0);
                         
                     if (danmakuTexts.length > 0) {
                         return `弹幕内容(部分): ${danmakuTexts.join(" | ")}`;
                     }
+                }
+                
+                // 尝试获取评论作为辅助信息
+                const comments = getBilibiliComments();
+                if (comments && comments.length > 0) {
+                    return '无法获取字幕/弹幕，以下是部分热门评论:\n' + comments.join('\n');
                 }
                 
                 return '由于浏览器扩展权限限制，无法获取完整字幕或弹幕内容。请使用视频标题、简介和其他元数据进行总结。';
@@ -1654,35 +1291,198 @@
             }
         }
         
-        // 提取Vimeo内容
+        // 获取Bilibili评论
+        function getBilibiliComments() {
+            try {
+                // 尝试多个评论选择器
+                const commentSelectors = [
+                    '.reply-content', 
+                    '.comment-content', 
+                    '.text',
+                    '.con',
+                    '[class*="comment"] [class*="content"]',
+                    '[class*="comment"] [class*="text"]',
+                    '[class*="reply"] [class*="content"]'
+                ];
+                
+                let commentsFound = [];
+                
+                // 尝试每个选择器
+                for (const selector of commentSelectors) {
+                    const elements = document.querySelectorAll(selector);
+                    if (elements && elements.length > 0) {
+                        // 获取前5条评论
+                        const maxComments = Math.min(5, elements.length);
+                        for (let i = 0; i < maxComments; i++) {
+                            const text = elements[i].textContent.trim();
+                            if (text && text.length > 5) {
+                                commentsFound.push(`评论${i+1}: ${text}`);
+                            }
+                        }
+                        
+                        if (commentsFound.length > 0) {
+                            break; // 找到评论后停止尝试其他选择器
+                        }
+                    }
+                }
+                
+                return commentsFound.length > 0 ? commentsFound : null;
+            } catch (error) {
+                console.error('获取Bilibili评论失败:', error);
+                return null;
+            }
+        }
+        
+        // 提取Vimeo内容 - 增强版
         async function extractVimeoContent() {
             try {
-                // 获取视频标题
-                const title = document.querySelector('h1[data-anchor], .clip_info-header h1')?.textContent.trim() || '';
+                // 视频信息对象
+                const videoInfo = {
+                    title: '',
+                    uploader: '',
+                    metaInfo: '',
+                    description: ''
+                };
                 
-                // 获取上传者信息
-                const uploader = document.querySelector('.clip_info-subline a, .pro-name')?.textContent.trim() || '';
+                // 通用查找函数 - 尝试多个选择器并返回第一个找到的内容
+                function findContent(selectors, defaultValue = '') {
+                    for (const selector of selectors) {
+                        try {
+                            const element = document.querySelector(selector);
+                            if (element && element.textContent.trim()) {
+                                return element.textContent.trim();
+                            }
+                        } catch (e) {
+                            console.log(`选择器 ${selector} 查找失败:`, e);
+                        }
+                    }
+                    return defaultValue;
+                }
                 
-                // 获取视频描述
-                const description = document.querySelector('.description, .clip_details-description')?.textContent.trim() || '';
+                // 提取标题 - 使用多层选择器
+                const titleSelectors = [
+                    'h1[data-anchor]', 
+                    '.clip_info-header h1',
+                    '[data-clip-title]',
+                    '.player_title',
+                    'h1.title',
+                    'h1', // 通用标题标签
+                    'meta[property="og:title"]', // OpenGraph标题
+                    'meta[name="title"]' // 通用meta标题
+                ];
+                
+                videoInfo.title = findContent(titleSelectors, '未能获取标题');
+                
+                // 如果依然无法获取标题，尝试从页面标题或meta标签获取
+                if (videoInfo.title === '未能获取标题') {
+                    // 尝试从document.title获取
+                    const pageTitle = document.title.replace(/ on Vimeo$/, '').trim();
+                    if (pageTitle) {
+                        videoInfo.title = pageTitle;
+                    } else {
+                        // 尝试从meta标签获取
+                        const metaTitle = document.querySelector('meta[property="og:title"]');
+                        if (metaTitle && metaTitle.getAttribute('content')) {
+                            videoInfo.title = metaTitle.getAttribute('content');
+                        }
+                    }
+                }
+                
+                // 提取上传者信息
+                const uploaderSelectors = [
+                    '.clip_info-subline a', 
+                    '.pro-name',
+                    '[data-clip-publisher]',
+                    '.video-owner a',
+                    '.user a',
+                    'meta[name="author"]',
+                    '[class*="owner"] a',
+                    '[class*="author"] a'
+                ];
+                
+                videoInfo.uploader = findContent(uploaderSelectors);
+                
+                // 提取视频元数据
+                const metaSelectors = [
+                    '.clip_info-meta', 
+                    '.video_meta',
+                    '.meta_info',
+                    '.stats',
+                    '[class*="meta"]',
+                    '[class*="info"]'
+                ];
+                
+                videoInfo.metaInfo = findContent(metaSelectors);
+                
+                // 提取视频描述
+                const descriptionSelectors = [
+                    '.description', 
+                    '.clip_details-description',
+                    '[data-clip-description]',
+                    '.video_description',
+                    '.description_content',
+                    'meta[property="og:description"]',
+                    'meta[name="description"]',
+                    '[class*="desc"]'
+                ];
+                
+                videoInfo.description = findContent(descriptionSelectors);
+                
+                // 如果依然无法获取描述，尝试从meta标签获取
+                if (!videoInfo.description) {
+                    const metaDesc = document.querySelector('meta[property="og:description"]');
+                    if (metaDesc && metaDesc.getAttribute('content')) {
+                        videoInfo.description = metaDesc.getAttribute('content');
+                    }
+                }
                 
                 // 整合视频信息
-                let videoInfo = `视频标题: ${title}\n\n`;
-                if (uploader) videoInfo += `上传者: ${uploader}\n\n`;
-                if (description) videoInfo += `视频描述: ${description}\n\n`;
-                videoInfo += '字幕: 由于浏览器扩展权限限制，无法获取Vimeo视频字幕。';
+                let formattedInfo = `视频标题: ${videoInfo.title}\n\n`;
+                if (videoInfo.uploader) formattedInfo += `上传者: ${videoInfo.uploader}\n\n`;
+                if (videoInfo.metaInfo) formattedInfo += `视频元数据: ${videoInfo.metaInfo}\n\n`;
+                if (videoInfo.description) formattedInfo += `视频描述: ${videoInfo.description}\n\n`;
+                formattedInfo += '字幕: 由于浏览器扩展权限限制，无法获取Vimeo视频字幕。';
                 
-                return videoInfo;
+                // 检查提取的信息是否足够
+                if (!videoInfo.title && !videoInfo.description) {
+                    throw new Error('无法提取足够的视频信息，请尝试刷新页面');
+                }
+                
+                // 清理内容中的冗余信息
+                return cleanContent(formattedInfo);
+                
             } catch (error) {
                 console.error('提取Vimeo内容失败:', error);
-                throw new Error('无法提取Vimeo视频信息: ' + error.message);
+                
+                // 尝试最后的备用方法 - 直接提取页面元数据
+                try {
+                    const title = document.title.replace(/ on Vimeo$/, '').trim();
+                    let description = '';
+                    const metaDesc = document.querySelector('meta[property="og:description"]');
+                    if (metaDesc) {
+                        description = metaDesc.getAttribute('content') || '';
+                    }
+                    
+                    if (title || description) {
+                        let fallbackInfo = `视频标题: ${title || '未知'}\n\n`;
+                        if (description) fallbackInfo += `视频描述: ${description}\n\n`;
+                        fallbackInfo += '无法获取更多视频详情，请尝试刷新页面后再试。';
+                        
+                        return fallbackInfo;
+                    }
+                } catch (fallbackError) {
+                    console.error('备用方法也失败:', fallbackError);
+                }
+                
+                throw error;
             }
         }
         
         // 返回公共API
         return {
             extractTextContent,
-            extractVideoContent
+            extractVideoContent,
+            resetCache
         };
     })();
  
@@ -1692,85 +1492,160 @@
      * ====================================================
      */
     const APIService = (function() {
+        // 获取当前API配置
+        function getCurrentAPI() {
+            const apiMode = localStorage.getItem(CONFIG.storageKeys.API_MODE) || CONFIG.apiMode;
+            
+            // 确保API模式有效
+            if (!CONFIG.apis[apiMode]) {
+                console.warn(`无效的API模式: ${apiMode}，使用默认模式: ${CONFIG.apiMode}`);
+                return CONFIG.apis[CONFIG.apiMode];
+            }
+            
+            // 返回当前API配置的深拷贝
+            const apiConfig = JSON.parse(JSON.stringify(CONFIG.apis[apiMode]));
+            
+            // 加载API密钥
+            apiConfig.apiKey = localStorage.getItem(CONFIG.storageKeys.API_KEY_OPENAI) || '';
+            if (apiMode === 'gemini') {
+                apiConfig.apiKey = localStorage.getItem(CONFIG.storageKeys.API_KEY_GEMINI) || '';
+            }
+            
+            // 重新添加函数属性
+            apiConfig.headers = CONFIG.apis[apiMode].headers;
+            apiConfig.buildRequestBody = CONFIG.apis[apiMode].buildRequestBody;
+            apiConfig.extractContent = CONFIG.apis[apiMode].extractContent;
+            
+            return apiConfig;
+        }
+        
+        // 设置API模式
+        function setApiMode(mode) {
+            if (CONFIG.apis[mode]) {
+                localStorage.setItem(CONFIG.storageKeys.API_MODE, mode);
+                return true;
+            }
+            return false;
+        }
+        
+        // 设置API密钥
+        function setApiKey(key, mode = 'openai') {
+            const storageKey = mode === 'gemini' ? 
+                CONFIG.storageKeys.API_KEY_GEMINI : 
+                CONFIG.storageKeys.API_KEY_OPENAI;
+                
+            localStorage.setItem(storageKey, key);
+            
+            // 同时更新全局配置
+            CONFIG.apis[mode].apiKey = key;
+        }
+        
+        // 测试API密钥
+        async function testApiKey(key, mode = 'openai') {
+            try {
+                // 临时设置密钥进行测试
+                const originalKey = CONFIG.apis[mode].apiKey;
+                CONFIG.apis[mode].apiKey = key;
+                
+                // 准备简单的测试消息
+                const messages = [
+                    { role: 'system', content: '测试API连接' },
+                    { role: 'user', content: '你好，这是一条测试消息' }
+                ];
+                
+                // 获取当前API配置
+                const api = CONFIG.apis[mode];
+                
+                // 发送简单请求
+                const url = mode === 'gemini' ? 
+                    `${api.url}?key=${key}` : 
+                    api.url;
+                
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: api.headers(),
+                    body: JSON.stringify(api.buildRequestBody(messages, 0.1, 20))
+                });
+                
+                // 恢复原始密钥
+                CONFIG.apis[mode].apiKey = originalKey;
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    return { 
+                        valid: false, 
+                        error: errorData.error?.message || '未知错误'
+                    };
+                }
+                
+                return { valid: true };
+            } catch (error) {
+                return { 
+                    valid: false, 
+                    error: error.message || '连接失败'
+                };
+            }
+        }
+        
         // 获取总结
         async function getSummary(content, length = CONFIG.summaryLength) {
             try {
+                // 检查API密钥
+                const api = getCurrentAPI();
+                if (!api.apiKey) {
+                    throw new Error('未设置API密钥，请点击设置按钮配置API密钥');
+                }
+                
                 // 准备用户提示词，包含长度限制
                 const userPrompt = `请总结以下内容，提取关键信息和主要观点，控制在${length}字以内：\n\n${content}`;
                 
-                // 准备请求体
-                const requestBody = {
-                    model: CONFIG.modelName,
-                    messages: [
-                        { role: 'system', content: CONFIG.summarySystemPrompt },
-                        { role: 'user', content: userPrompt }
-                    ],
-                    temperature: CONFIG.temperature,
-                    max_tokens: CONFIG.maxTokens
-                };
+                // 准备消息数组
+                const messages = [
+                    { role: 'system', content: CONFIG.summarySystemPrompt },
+                    { role: 'user', content: userPrompt }
+                ];
                 
-                // 发起API请求
-                const response = await fetch(CONFIG.apiUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${CONFIG.apiKey}`
-                    },
-                    body: JSON.stringify(requestBody)
-                });
+                // 发起API请求（带重试机制）
+                const response = await makeRequestWithRetry(api, messages, CONFIG.temperature, length > CONFIG.summaryLength ? CONFIG.detailedMaxTokens : CONFIG.maxTokens);
                 
-                // 处理API响应
-                await checkResponseStatus(response);
-                const data = await response.json();
-                return data.choices[0].message.content;
+                return response;
                 
             } catch (error) {
                 console.error('获取摘要失败:', error);
-                handleApiError(error);
+                throw handleApiError(error);
             }
         }
         
         // 获取关键要点
         async function getKeypoints(content) {
             try {
-                // 准备请求体
-                const requestBody = {
-                    model: CONFIG.modelName,
-                    messages: [
-                        { 
-                            role: 'system', 
-                            content: '你是一个擅长提取关键要点和生成相关问题的AI助手。请按照用户的要求，从提供的内容中提取关键要点和生成问题建议。'
-                        },
-                        { 
-                            role: 'user', 
-                            content: CONFIG.keypointsPrompt + '\n\n' + content
-                        }
-                    ],
-                    temperature: CONFIG.temperature,
-                    max_tokens: CONFIG.maxTokens
-                };
+                // 检查API密钥
+                const api = getCurrentAPI();
+                if (!api.apiKey) {
+                    throw new Error('未设置API密钥，请点击设置按钮配置API密钥');
+                }
                 
-                // 发起API请求
-                const response = await fetch(CONFIG.apiUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${CONFIG.apiKey}`
+                // 准备消息数组
+                const messages = [
+                    { 
+                        role: 'system', 
+                        content: '你是一个擅长提取关键要点和生成相关问题的AI助手。请按照用户的要求，从提供的内容中提取关键要点和生成问题建议。'
                     },
-                    body: JSON.stringify(requestBody)
-                });
+                    { 
+                        role: 'user', 
+                        content: CONFIG.keypointsPrompt + '\n\n' + content
+                    }
+                ];
                 
-                // 处理API响应
-                await checkResponseStatus(response);
-                const data = await response.json();
+                // 发起API请求（带重试机制）
+                const responseContent = await makeRequestWithRetry(api, messages, CONFIG.temperature, CONFIG.maxTokens);
                 
                 // 提取JSON数据
-                const content = data.choices[0].message.content;
-                return extractJsonFromString(content);
+                return extractJsonFromString(responseContent);
                 
             } catch (error) {
                 console.error('获取关键要点失败:', error);
-                handleApiError(error);
+                throw handleApiError(error);
             }
         }
         
@@ -1780,15 +1655,24 @@
                 // 尝试查找JSON内容
                 const jsonMatch = text.match(/\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}/);
                 if (jsonMatch) {
-                    return JSON.parse(jsonMatch[0]);
+                    const jsonData = JSON.parse(jsonMatch[0]);
+                    
+                    // 验证JSON结构是否符合预期
+                    if (jsonData.keypoints && Array.isArray(jsonData.keypoints) && 
+                        jsonData.suggestedQuestions && Array.isArray(jsonData.suggestedQuestions)) {
+                        return jsonData;
+                    }
                 }
                 
-                // 如果没找到JSON，构造默认格式
+                // 如果JSON格式不符合预期，尝试更复杂的解析
+                const keypoints = extractKeypoints(text);
+                const questions = extractQuestions(text);
+                
                 return {
-                    keypoints: [
+                    keypoints: keypoints.length > 0 ? keypoints : [
                         { title: "无法解析关键要点", detail: "API返回的数据格式不正确" }
                     ],
-                    suggestedQuestions: ["这篇内容的主要观点是什么?"]
+                    suggestedQuestions: questions.length > 0 ? questions : ["这篇内容的主要观点是什么?"]
                 };
             } catch (error) {
                 console.error('解析JSON失败:', error);
@@ -1801,9 +1685,108 @@
             }
         }
         
+        // 提取关键要点（备用方法）
+        function extractKeypoints(text) {
+            const keypoints = [];
+            
+            // 尝试查找关键要点部分
+            const keypointsSection = text.match(/keypoints[:\s]*[\[\{][\s\S]*?[\]\}]/i);
+            if (keypointsSection) {
+                // 尝试查找标题和详情对
+                const pointMatches = keypointsSection[0].match(/["']title["']\s*:\s*["'](.+?)["']\s*,\s*["']detail["']\s*:\s*["'](.+?)["']/gi);
+                
+                if (pointMatches) {
+                    pointMatches.forEach(match => {
+                        const titleMatch = match.match(/["']title["']\s*:\s*["'](.+?)["']/i);
+                        const detailMatch = match.match(/["']detail["']\s*:\s*["'](.+?)["']/i);
+                        
+                        if (titleMatch && detailMatch) {
+                            keypoints.push({
+                                title: titleMatch[1],
+                                detail: detailMatch[1]
+                            });
+                        }
+                    });
+                }
+            }
+            
+            // 如果上述方法失败，尝试查找冒号分隔的行
+            if (keypoints.length === 0) {
+                const lines = text.split('\n');
+                let inKeypointsSection = false;
+                
+                for (const line of lines) {
+                    if (/keypoints|key\s*points|关键\s*要点/i.test(line)) {
+                        inKeypointsSection = true;
+                        continue;
+                    }
+                    
+                    if (inKeypointsSection && /suggested\s*questions|问题建议/i.test(line)) {
+                        break;
+                    }
+                    
+                    if (inKeypointsSection && line.trim()) {
+                        const parts = line.split(':');
+                        if (parts.length >= 2) {
+                            keypoints.push({
+                                title: parts[0].trim().replace(/^\d+\.\s*/, ''),
+                                detail: parts.slice(1).join(':').trim()
+                            });
+                        }
+                    }
+                }
+            }
+            
+            return keypoints;
+        }
+        
+        // 提取问题（备用方法）
+        function extractQuestions(text) {
+            const questions = [];
+            
+            // 尝试查找建议问题部分
+            const questionsSection = text.match(/suggestedQuestions[:\s]*\[[\s\S]*?\]/i);
+            if (questionsSection) {
+                // 尝试查找问题字符串
+                const questionMatches = questionsSection[0].match(/["']([^"']+\?)["']/g);
+                
+                if (questionMatches) {
+                    questionMatches.forEach(match => {
+                        const question = match.replace(/^["']|["']$/g, '');
+                        questions.push(question);
+                    });
+                }
+            }
+            
+            // 如果上述方法失败，尝试查找问号结尾的行
+            if (questions.length === 0) {
+                const lines = text.split('\n');
+                let inQuestionsSection = false;
+                
+                for (const line of lines) {
+                    if (/suggested\s*questions|问题建议/i.test(line)) {
+                        inQuestionsSection = true;
+                        continue;
+                    }
+                    
+                    if (inQuestionsSection && line.trim().endsWith('?')) {
+                        questions.push(line.trim().replace(/^\d+\.\s*/, ''));
+                    }
+                }
+            }
+            
+            return questions;
+        }
+        
         // 提问问题
         async function askQuestion(question, summary, originalContent) {
             try {
+                // 检查API密钥
+                const api = getCurrentAPI();
+                if (!api.apiKey) {
+                    throw new Error('未设置API密钥，请点击设置按钮配置API密钥');
+                }
+                
                 // 准备上下文
                 let context = summary;
                 if (!context && originalContent) {
@@ -1812,57 +1795,117 @@
                     context = "没有可用的内容上下文";
                 }
                 
-                // 准备请求体
-                const requestBody = {
-                    model: CONFIG.modelName,
-                    messages: [
-                        { role: 'system', content: CONFIG.conversationSystemPrompt },
-                        { 
-                            role: 'user', 
-                            content: `基于以下内容回答问题：\n\n${context}\n\n问题：${question}`
-                        }
-                    ],
-                    temperature: CONFIG.temperature,
-                    max_tokens: CONFIG.maxTokens
-                };
+                // 准备消息数组
+                const messages = [
+                    { role: 'system', content: CONFIG.conversationSystemPrompt },
+                    { 
+                        role: 'user', 
+                        content: `基于以下内容回答问题：\n\n${context}\n\n问题：${question}`
+                    }
+                ];
                 
-                // 发起API请求
-                const response = await fetch(CONFIG.apiUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${CONFIG.apiKey}`
-                    },
-                    body: JSON.stringify(requestBody)
-                });
+                // 发起API请求（带重试机制）
+                const response = await makeRequestWithRetry(api, messages, CONFIG.temperature, CONFIG.maxTokens);
                 
-                // 处理API响应
-                await checkResponseStatus(response);
-                const data = await response.json();
-                return data.choices[0].message.content;
+                return response;
                 
             } catch (error) {
                 console.error('问答请求失败:', error);
-                handleApiError(error);
+                throw handleApiError(error);
             }
+        }
+        
+        // 带重试机制的API请求
+        async function makeRequestWithRetry(api, messages, temperature, maxTokens) {
+            let lastError;
+            
+            for (let attempt = 0; attempt < CONFIG.retryCount; attempt++) {
+                try {
+                    // 如果不是第一次尝试，等待一段时间
+                    if (attempt > 0) {
+                        await new Promise(resolve => setTimeout(resolve, CONFIG.retryDelays[attempt - 1]));
+                        console.log(`重试API请求 (${attempt + 1}/${CONFIG.retryCount})...`);
+                    }
+                    
+                    // 构建请求体
+                    const requestBody = api.buildRequestBody(messages, temperature, maxTokens);
+                    
+                    // 添加API密钥到URL（适用于Gemini API）
+                    let url = api.url;
+                    if (api === CONFIG.apis.gemini) {
+                        url += `?key=${api.apiKey}`;
+                    }
+                    
+                    // 发起API请求
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: api.headers(),
+                        body: JSON.stringify(requestBody)
+                    });
+                    
+                    // 检查响应状态
+                    await checkResponseStatus(response);
+                    
+                    // 解析响应
+                    const data = await response.json();
+                    
+                    // 提取内容
+                    return api.extractContent(data);
+                    
+                } catch (error) {
+                    lastError = error;
+                    
+                    // 检查是否是API密钥错误
+                    if (error.message && (
+                        error.message.includes('API密钥无效') || 
+                        error.message.includes('认证失败') ||
+                        error.message.includes('未设置API密钥')
+                    )) {
+                        throw error; // 密钥错误不重试
+                    }
+                    
+                    // 如果是最后一次尝试，抛出异常
+                    if (attempt === CONFIG.retryCount - 1) {
+                        throw error;
+                    }
+                }
+            }
+            
+            // 所有重试都失败
+            throw lastError;
         }
         
         // 检查API响应状态
         async function checkResponseStatus(response) {
             if (!response.ok) {
-                const errorData = await response.json();
-                const errorMessage = errorData.error?.message || '未知错误';
-                const errorCode = errorData.error?.code || '';
+                let errorMessage = `API请求失败: HTTP ${response.status}`;
                 
-                // 根据错误代码提供友好错误信息
-                if (errorCode === 'invalid_api_key') {
-                    throw new Error('API密钥无效，请在CONFIG.apiKey中填入正确的API密钥');
-                } else if (errorCode === 'context_length_exceeded') {
-                    throw new Error('内容过长，超出模型处理限制');
-                } else if (errorCode === 'rate_limit_exceeded') {
-                    throw new Error('API调用频率超限，请稍后再试');
-                } else {
-                    throw new Error(`API错误 (${errorCode}): ${errorMessage}`);
+                try {
+                    const errorData = await response.json();
+                    const errorDetails = errorData.error || {};
+                    const errorCode = errorDetails.code || errorDetails.status || '';
+                    const errorText = errorDetails.message || errorDetails.error || '未知错误';
+                    
+                    console.error('API错误详情:', errorData);
+                    
+                    // 根据错误代码提供友好错误信息
+                    if (errorCode === 'invalid_api_key' || errorCode === 'UNAUTHENTICATED' || 
+                        errorText.includes('API key') || errorText.includes('认证')) {
+                        throw new Error('API密钥无效，请检查设置');
+                    } else if (errorCode === 'context_length_exceeded' || errorCode === 'RESOURCE_EXHAUSTED' ||
+                              errorText.includes('too long')) {
+                        throw new Error('内容过长，超出模型处理限制');
+                    } else if (errorCode === 'rate_limit_exceeded' || errorCode === 'RESOURCE_EXHAUSTED' ||
+                              errorText.includes('rate limit')) {
+                        throw new Error('API调用频率超限，请稍后再试');
+                    } else {
+                        throw new Error(`API错误 (${errorCode}): ${errorText}`);
+                    }
+                } catch (parseError) {
+                    if (parseError.message && parseError.message !== 'API请求失败') {
+                        throw parseError;
+                    }
+                    throw new Error(errorMessage);
                 }
             }
             return response;
@@ -1870,84 +1913,423 @@
         
         // 处理API错误
         function handleApiError(error) {
-            if (error.message.includes('Failed to fetch')) {
-                throw new Error('网络连接失败，请检查您的网络并确保API端点可访问');
+            if (error.message.includes('Failed to fetch') || error.name === 'TypeError') {
+                return new Error('网络连接失败，请检查您的网络并确保API端点可访问');
             }
-            throw error;
+            return error;
         }
         
         // 返回公共API
         return {
             getSummary,
             getKeypoints,
-            askQuestion
+            askQuestion,
+            getCurrentAPI,
+            setApiMode,
+            setApiKey,
+            testApiKey
         };
     })();
  
     /**
      * ====================================================
-     * 5. 工具函数
+     * 5. UI控制器
      * ====================================================
      */
-    const Utils = (function() {
-        // 防抖函数
-        function debounce(func, wait) {
-            let timeout;
-            return function(...args) {
-                clearTimeout(timeout);
-                timeout = setTimeout(() => func.apply(this, args), wait);
-            };
+    const UIController = (function() {
+        // UI元素引用
+        let summaryButton = null;
+        let dialogContainer = null;
+        let minimizedIcon = null;
+        let activeTab = 'summary'; // 当前激活的标签: summary, keypoints, conversation
+        let isDetailedSummary = false; // 当前是否为详细摘要
+        
+        // 初始化UI
+        function initialize() {
+            // 检测深色模式
+            detectColorScheme();
+            
+            // 添加事件监听器，以便在颜色方案变化时更新
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', detectColorScheme);
+            
+            // 创建总结按钮
+            createSummaryButton();
+            
+            // 创建必要的样式
+            createStyles();
+            
+            // 缓存DOM元素引用
+            cacheDOMReferences();
         }
         
-        // 节流函数
-        function throttle(func, limit) {
-            let inThrottle;
-            return function(...args) {
-                if (!inThrottle) {
-                    func.apply(this, args);
-                    inThrottle = true;
-                    setTimeout(() => inThrottle = false, limit);
-                }
-            };
+        // 缓存重要DOM元素的引用
+        function cacheDOMReferences() {
+            // 将在对话框创建后执行缓存
+            domCache = {};
         }
         
-        // 安全解析JSON
-        function safeParseJSON(str, fallback = null) {
-            try {
-                return JSON.parse(str);
-            } catch (e) {
-                console.error('JSON解析错误:', e);
-                return fallback;
+        // 更新DOM缓存
+        function updateDOMCache() {
+            if (!dialogContainer) return;
+            
+            // 缓存常用元素
+            domCache.summaryContent = document.getElementById('summary-content');
+            domCache.keypointsContainer = document.getElementById('keypoints-container');
+            domCache.suggestedQuestions = document.getElementById('suggested-questions');
+            domCache.conversationContainer = document.getElementById('conversation-container');
+            domCache.userQuestion = document.getElementById('user-question');
+            domCache.summaryActions = document.querySelector('.summary-actions');
+        }
+        
+        // 检测颜色方案
+        function detectColorScheme() {
+            isDarkMode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+            console.log(`检测到${isDarkMode ? '深色' : '浅色'}模式`);
+            
+            // 如果对话框已经存在，更新其样式
+            if (dialogContainer) {
+                updateColorScheme();
             }
         }
         
-        // 获取当前URL的域名
-        function getDomain() {
-            return window.location.hostname;
+        // 更新颜色方案
+        function updateColorScheme() {
+            const colors = isDarkMode ? CONFIG.colors.dark : CONFIG.colors.light;
+            
+            // 更新对话框的颜色
+            if (dialogContainer) {
+                dialogContainer.style.backgroundColor = colors.backgroundColor;
+                dialogContainer.style.color = colors.textColor;
+                
+                // 更新标题栏
+                const header = dialogContainer.querySelector('.dialog-header');
+                if (header) {
+                    header.style.backgroundColor = colors.secondaryBgColor;
+                    header.style.borderBottomColor = colors.borderColor;
+                }
+                
+                // 更新标签栏
+                const tabs = dialogContainer.querySelectorAll('.tab-button');
+                tabs.forEach(tab => {
+                    if (tab.classList.contains('active')) {
+                        tab.style.backgroundColor = colors.primaryColor + '20'; // 20%透明度
+                        tab.style.color = colors.primaryColor;
+                    } else {
+                        tab.style.backgroundColor = 'transparent';
+                        tab.style.color = colors.secondaryTextColor;
+                    }
+                });
+            }
+            
+            // 更新按钮颜色
+            if (summaryButton) {
+                summaryButton.style.backgroundColor = colors.primaryColor;
+            }
         }
         
-        // 检测是否为移动设备
-        function isMobileDevice() {
-            return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-        }
-        
-        // 截断文本
-        function truncateText(text, maxLength = 100) {
-            if (text.length <= maxLength) return text;
-            return text.slice(0, maxLength) + '...';
-        }
-        
-        // 返回公共API
-        return {
-            debounce,
-            throttle,
-            safeParseJSON,
-            getDomain,
-            isMobileDevice,
-            truncateText
-        };
-    })();
-    
-    // 页面加载完成后初始化插件
-    window.addEventListener('load', initializePlugin);
-})();
+        // 创建样式
+        function createStyles() {
+            const lightColors = CONFIG.colors.light;
+            const darkColors = CONFIG.colors.dark;
+            
+            const style = document.createElement('style');
+            style.textContent = `
+                .ai-summary-button {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    z-index: 9999;
+                    background-color: ${lightColors.primaryColor};
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    width: 50px;
+                    height: 50px;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                    -webkit-box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                    transition: all 0.3s ease;
+                    -webkit-transition: all 0.3s ease;
+                    appearance: none;
+                    -webkit-appearance: none;
+                }
+                
+                .ai-summary-button:hover {
+                    transform: scale(1.05);
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                    -webkit-box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                }
+                
+                .ai-summary-button:active {
+                    transform: scale(0.95);
+                }
+                
+                .ai-summary-button svg {
+                    width: 24px;
+                    height: 24px;
+                }
+                
+                .ai-summary-dialog {
+                    position: fixed;
+                    right: 30px;
+                    bottom: 30px;
+                    width: ${CONFIG.ui.width};
+                    height: ${CONFIG.ui.initialHeight};
+                    min-height: ${CONFIG.ui.minHeight};
+                    max-height: ${CONFIG.ui.maxHeight};
+                    max-width: 85vw;
+                    background-color: ${lightColors.backgroundColor};
+                    color: ${lightColors.textColor};
+                    border-radius: 10px;
+                    box-shadow: 0 5px 20px rgba(0,0,0,0.3);
+                    -webkit-box-shadow: 0 5px 20px rgba(0,0,0,0.3);
+                    display: flex;
+                    flex-direction: column;
+                    z-index: 10000;
+                    overflow: hidden;
+                    font-family: ${CONFIG.fontFamily};
+                    transition: all ${CONFIG.ui.animationDuration} ease;
+                }
+                
+                /* 深色模式样式 */
+                @media (prefers-color-scheme: dark) {
+                    .ai-summary-dialog {
+                        background-color: ${darkColors.backgroundColor};
+                        color: ${darkColors.textColor};
+                        box-shadow: 0 5px 20px rgba(0,0,0,0.5);
+                        -webkit-box-shadow: 0 5px 20px rgba(0,0,0,0.5);
+                    }
+                    
+                    .ai-summary-button {
+                        background-color: ${darkColors.primaryColor};
+                    }
+                }
+                
+                @media (max-width: 480px) {
+                    .ai-summary-dialog {
+                        width: ${CONFIG.ui.mobileWidth};
+                        right: 15px;
+                        bottom: 15px;
+                    }
+                }
+                
+                .dialog-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 8px 15px;
+                    background-color: ${lightColors.secondaryBgColor};
+                    border-bottom: 1px solid ${lightColors.borderColor};
+                    user-select: none;
+                    height: 38px;
+                    box-sizing: border-box;
+                }
+                
+                @media (prefers-color-scheme: dark) {
+                    .dialog-header {
+                        background-color: ${darkColors.secondaryBgColor};
+                        border-bottom: 1px solid ${darkColors.borderColor};
+                    }
+                }
+                
+                .dialog-header h3 {
+                    margin: 0;
+                    font-size: 16px;
+                    font-weight: 500;
+                    color: inherit;
+                }
+                
+                .dialog-controls {
+                    display: flex;
+                    gap: 8px;
+                }
+                
+                .icon-button {
+                    background: none;
+                    border: none;
+                    font-size: 16px;
+                    cursor: pointer;
+                    width: 24px;
+                    height: 24px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    border-radius: 4px;
+                    transition: background-color 0.2s;
+                    color: inherit;
+                }
+                
+                .icon-button:hover {
+                    background-color: rgba(0,0,0,0.1);
+                }
+                
+                @media (prefers-color-scheme: dark) {
+                    .icon-button:hover {
+                        background-color: rgba(255,255,255,0.1);
+                    }
+                }
+                
+                .tabs-container {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    height: 38px;
+                    border-bottom: 1px solid ${lightColors.borderColor};
+                    background-color: ${lightColors.backgroundColor};
+                }
+                
+                @media (prefers-color-scheme: dark) {
+                    .tabs-container {
+                        border-bottom: 1px solid ${darkColors.borderColor};
+                        background-color: ${darkColors.backgroundColor};
+                    }
+                }
+                
+                .tab-button {
+                    flex: 1;
+                    height: 100%;
+                    background: none;
+                    border: none;
+                    cursor: pointer;
+                    font-size: 14px;
+                    font-weight: 500;
+                    color: ${lightColors.secondaryTextColor};
+                    transition: all 0.2s;
+                    position: relative;
+                }
+                
+                @media (prefers-color-scheme: dark) {
+                    .tab-button {
+                        color: ${darkColors.secondaryTextColor};
+                    }
+                }
+                
+                .tab-button:hover {
+                    background-color: rgba(0,0,0,0.05);
+                }
+                
+                @media (prefers-color-scheme: dark) {
+                    .tab-button:hover {
+                        background-color: rgba(255,255,255,0.05);
+                    }
+                }
+                
+                .tab-button.active {
+                    color: ${lightColors.primaryColor};
+                    background-color: ${lightColors.primaryColor}20;
+                }
+                
+                @media (prefers-color-scheme: dark) {
+                    .tab-button.active {
+                        color: ${darkColors.primaryColor};
+                        background-color: ${darkColors.primaryColor}20;
+                    }
+                }
+                
+                .tab-button.active::after {
+                    content: '';
+                    position: absolute;
+                    bottom: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 2px;
+                    background-color: ${lightColors.primaryColor};
+                }
+                
+                @media (prefers-color-scheme: dark) {
+                    .tab-button.active::after {
+                        background-color: ${darkColors.primaryColor};
+                    }
+                }
+                
+                .dialog-body {
+                    flex: 1;
+                    display: flex;
+                    flex-direction: column;
+                    overflow: hidden;
+                    position: relative;
+                }
+                
+                .tab-content {
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow-y: auto;
+                    overflow-x: hidden;
+                    display: none;
+                    padding: 12px 15px;
+                    box-sizing: border-box;
+                    word-wrap: break-word;
+                    overflow-wrap: break-word;
+                    scroll-behavior: smooth;
+                }
+                
+                .tab-content.active {
+                    display: block;
+                }
+                
+                #summary-tab {
+                    display: flex;
+                    flex-direction: column;
+                }
+                
+                #keypoints-tab {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 10px;
+                }
+                
+                #conversation-tab {
+                    display: flex;
+                    flex-direction: column;
+                }
+                
+                .summary-text {
+                    flex: 1;
+                    line-height: 1.5;
+                    font-size: 14px;
+                    overflow-y: auto;
+                    padding-right: 5px;
+                    margin-bottom: 10px;
+                    word-wrap: break-word;
+                    overflow-wrap: break-word;
+                    white-space: normal;
+                }
+                
+                .summary-text p {
+                    margin-bottom: 10px;
+                }
+                
+                .summary-actions {
+                    display: flex;
+                    justify-content: space-between;
+                    margin-top: auto;
+                    padding-top: 8px;
+                }
+                
+                .summary-button {
+                    background-color: ${lightColors.secondaryBgColor};
+                    color: ${lightColors.textColor};
+                    border: 1px solid ${lightColors.borderColor};
+                    border-radius: 18px;
+                    padding: 6px 12px;
+                    cursor: pointer;
+                    font-size: 13px;
+                    transition: all 0.2s ease;
+                }
+                
+                @media (prefers-color-scheme: dark) {
+                    .summary-button {
+                        background-color: ${darkColors.secondaryBgColor};
+                        color: ${darkColors.textColor};
+                        border: 1px solid ${darkColors.borderColor};
+                    }
+                }
+                
+                .summary-button:hover {
+                    background-color: ${lightColors.borderColor};
